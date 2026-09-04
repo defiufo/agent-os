@@ -15,12 +15,12 @@ network egress) need intent-level memory.
 
 from __future__ import annotations
 
-from collections import OrderedDict
 import os
 import re
 import shlex
 import threading
 import time
+from collections import OrderedDict
 from pathlib import Path
 
 _DEFAULT_TTL_SECONDS = 30 * 60

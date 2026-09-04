@@ -8,30 +8,48 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import sys
 from pathlib import Path
 
 import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
-SCRIPT = ROOT / "src" / "agentos" / "skills" / "bundled" / "gmgn-portfolio" / "scripts" / "rebalance.py"
+SCRIPT = (
+    ROOT
+    / "src"
+    / "agentos"
+    / "skills"
+    / "bundled"
+    / "gmgn-portfolio"
+    / "scripts"
+    / "rebalance.py"
+)
 
 
 def _load_module():
     spec = importlib.util.spec_from_file_location("gmgn_portfolio_rebalance", SCRIPT)
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
     spec.loader.exec_module(module)
     return module
 
 
 mod = _load_module()
 
+SOL = "So11111111111111111111111111111111111111112"
+USDC = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+BONK = "DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263"
 
 HOLDINGS = {
     "holdings": [
-        {"token": {"symbol": "SOL", "address": "So11111111111111111111111111111111111111112"}, "usd_value": 50, "balance": 1},
-        {"token": {"symbol": "USDC", "address": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"}, "usd_value": 30, "balance": 30},
-        {"token": {"symbol": "BONK", "address": "DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263"}, "usd_value": 20, "balance": 2_000_000},
+        {"token": {"symbol": "SOL", "address": SOL}, "usd_value": 50, "balance": 1},
+        {"token": {"symbol": "USDC", "address": USDC}, "usd_value": 30, "balance": 30},
+        {
+            "token": {"symbol": "BONK", "address": BONK},
+            "usd_value": 20,
+            "balance": 2_000_000,
+        },
     ]
 }
 
@@ -88,7 +106,8 @@ def test_unspecified_holding_is_flagged_as_remainder() -> None:
 def test_equal_weight_baseline() -> None:
     holdings = mod.extract_holdings(HOLDINGS)
     targets = mod.resolve_targets(holdings, {})
-    assert targets == {"SOL": pytest.approx(100 / 3), "USDC": pytest.approx(100 / 3), "BONK": pytest.approx(100 / 3)}
+    share = pytest.approx(100 / 3)
+    assert targets == {"SOL": share, "USDC": share, "BONK": share}
 
 
 def test_cli_fixture_path(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
