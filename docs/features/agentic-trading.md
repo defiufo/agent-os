@@ -93,7 +93,7 @@ before they execute anything.
 | `gmgn-swap` | Buy and sell tokens on Solana, BSC, Base, and Ethereum: single swap, multi-wallet batch, limit orders, stop loss, take profit, and trailing variants. |
 | `gmgn-market` | Price charts (K-line, OHLCV), trending rankings by volume, new launchpad listings, and hot-search rankings. |
 | `gmgn-token` | Per-token research: price, market cap, liquidity, holders, top Smart Money and KOL positions, security audit, and social links. |
-| `gmgn-portfolio` | Wallet analysis: holdings, realized and unrealized P&L, win rate, history, and developer-wallet token history. |
+| `gmgn-portfolio` | Wallet analysis: holdings, realized and unrealized P&L, win rate, history, developer-wallet token history, and allocation drift versus a target mix. |
 | `gmgn-track` | Real-time buy and sell activity from Smart Money wallets, KOL wallets, and wallets you follow. |
 | `gmgn-holder-analysis` | Holder-structure analysis: chip distribution, entry cost, whale and dev behavior, and risk wallets. |
 | `gmgn-wallet-analysis` | Copy-trade dossier on one wallet: four pass/fail gates (authenticity, currency, reachability, survivability), what it holds and buys now, copy window, and a size cap. |
