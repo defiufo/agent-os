@@ -242,6 +242,93 @@ async def test_slack_interactive_payload_unsigned_rejected() -> None:
     assert resp.status_code == 401
 
 
+def _unsigned_json_request(payload: dict[str, Any]) -> Request:
+    body = json.dumps(payload).encode()
+    request = Request({"type": "http", "method": "POST", "headers": []})
+
+    async def _body() -> bytes:
+        return body
+
+    request.body = _body  # type: ignore[method-assign]
+    return request
+
+
+@pytest.mark.asyncio
+async def test_slack_event_callback_unsigned_rejected() -> None:
+    """No signing secret means no way to attribute the POST to Slack, so the
+    event must not be ingested (GH #674)."""
+    channel = SlackChannel(token="xoxb-test", slack_channel_id="C12345", signing_secret=None)
+
+    resp = await channel._handle_webhook(  # noqa: SLF001
+        _unsigned_json_request(
+            {
+                "type": "event_callback",
+                "event": {
+                    "type": "message",
+                    "user": "U1",
+                    "channel": "C12345",
+                    "text": "pwned",
+                    "ts": "1710000000.000100",
+                    "channel_type": "im",
+                },
+            }
+        )
+    )
+
+    assert resp.status_code == 401
+    assert channel._queue.empty()  # noqa: SLF001
+
+
+@pytest.mark.asyncio
+async def test_slack_slash_command_unsigned_rejected() -> None:
+    """Slash commands ride the same unauthenticated path as event callbacks."""
+    channel = SlackChannel(token="xoxb-test", slack_channel_id="C12345", signing_secret=None)
+    scope = {
+        "type": "http",
+        "method": "POST",
+        "headers": [(b"content-type", b"application/x-www-form-urlencoded")],
+    }
+    request = Request(scope)
+
+    async def _body() -> bytes:
+        return b"command=%2Fstatus&user_id=U1&channel_id=C12345"
+
+    request.body = _body  # type: ignore[method-assign]
+
+    resp = await channel._handle_webhook(request)  # noqa: SLF001
+
+    assert resp.status_code == 401
+    assert channel._queue.empty()  # noqa: SLF001
+
+
+@pytest.mark.asyncio
+async def test_slack_event_callback_rejected_when_signing_secret_is_blank() -> None:
+    """An empty HMAC key verifies anything an attacker signs with it, so a
+    blank secret counts as no secret."""
+    channel = SlackChannel(token="xoxb-test", slack_channel_id="C12345", signing_secret="")
+
+    resp = await channel._handle_webhook(  # noqa: SLF001
+        _unsigned_json_request({"type": "event_callback", "event": {"type": "message"}})
+    )
+
+    assert resp.status_code == 401
+    assert channel._queue.empty()  # noqa: SLF001
+
+
+@pytest.mark.asyncio
+async def test_slack_url_verification_still_answered_unsigned() -> None:
+    """The handshake has no side effects, so it stays open — an operator can
+    pass Slack's endpoint check before the signing secret is wired up."""
+    channel = SlackChannel(token="xoxb-test", slack_channel_id="C12345", signing_secret=None)
+
+    resp = await channel._handle_webhook(  # noqa: SLF001
+        _unsigned_json_request({"type": "url_verification", "challenge": "abc123"})
+    )
+
+    assert resp.status_code == 200
+    assert json.loads(bytes(resp.body)) == {"challenge": "abc123"}
+
+
 @pytest.mark.asyncio
 async def test_discord_component_interaction_handling() -> None:
     queue = get_approval_queue()

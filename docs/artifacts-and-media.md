@@ -42,17 +42,36 @@ Use artifacts for:
 
 Use chat text for short answers, decisions, and next steps.
 
-## Inline Charts
+## Inline Charts and Cards
 
 Most artifacts render in Web UI chat as a download chip; images and audio render
-inline. One more mime renders inline as an interactive chart:
+inline. Two more mimes render inline:
 
 | Mime | Rendered as |
 |------|-------------|
 | `application/vnd.agentos.chart+json` | Candlestick chart with a volume histogram |
+| `application/vnd.agentos.cards+json` | Responsive grid of record cards |
 
-There is nothing to register: any skill gets a chart by publishing a file with
-that mime. Two steps, and both have a failure mode worth knowing.
+There is nothing to register: any skill gets one by publishing a file with that
+mime. Two steps, and both have a failure mode worth knowing.
+
+**`exec_command` publishes these two mimes for you.** When a command's stdout
+contains a line that is exactly
+
+```
+publish_artifact path=<file> mime=application/vnd.agentos.<something>+json
+```
+
+the artifact is published automatically and the marker is replaced with a note
+telling the model not to publish it again. This is deliberate: leaving the call
+to the model meant the file got written and the UI never drew, because the model
+would answer with a hand-written table instead. Only the
+`application/vnd.agentos.` family auto-publishes — a plain file still needs an
+explicit `publish_artifact` call, so ordinary command output cannot push a
+workspace file at the user. Path containment is enforced by `publish_artifact`
+itself, unchanged.
+
+Write the marker on its own line: prose that merely mentions it is ignored.
 
 **1. Write the JSON inside the workspace.** Scripts run with the workspace as
 their working directory, so a bare filename lands in the right place.
@@ -88,6 +107,47 @@ The body is:
 candle field is required. Rows may arrive in any order and may repeat a
 timestamp — the renderer sorts them and keeps the last entry per timestamp.
 `title` and `subtitle` are display-only text, never markup.
+
+### Card grids
+
+Use cards when the answer is a handful of small records rather than a series —
+a token lookup, a holder list, a search result. They stay readable where a
+markdown table would not: a 42-character contract address puts a table into a
+horizontal scroll, while a card gives it its own line and a copy button.
+
+```json
+{
+  "type": "cards",
+  "title": "Robinhood Chain — Apple",
+  "subtitle": "optional caveat carried under the heading",
+  "cards": [
+    {
+      "title": "AAPL",
+      "subtitle": "Apple",
+      "logo": "https://assets.example/aapl.png",
+      "badge": "verified",
+      "badgeTone": "positive",
+      "fields": [
+        { "label": "Address", "value": "0xaf3d…93f9", "copyable": true },
+        { "label": "Chain", "value": "4663" }
+      ]
+    }
+  ]
+}
+```
+
+Only `cards` and each card's `title` are required. `badgeTone` is one of
+`positive` / `warning` / `danger` / `neutral`, and anything else falls back to
+`neutral`, so a skill can ship a new status without waiting on a frontend
+release. `copyable` renders the value in monospace with a copy button. `logo`
+must be an `http(s)` URL — other schemes are dropped rather than sanitised.
+
+At most 24 cards render; the rest are counted and reported under the grid
+instead of being dropped silently. Every string is display-only text, never
+markup — see `frontend/src/views/chat/transcript/cards.ts`.
+
+`robinhood-rwa-addresses` is the worked example: `scripts/rwa_cards.py` reads
+the lookup's JSON on stdin and writes this payload.
 
 Hovering a candle reveals its open, high, low, close, volume, and the move from
 open to close as a percentage, so there is no need to repeat those numbers in

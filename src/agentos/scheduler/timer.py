@@ -40,6 +40,7 @@ class SchedulerTimer:
         self._max_catchup = max_catchup
         self._reaper = reaper
         self._running: dict[str, asyncio.Task] = {}
+        self._catchup_tasks: set[asyncio.Task[None]] = set()
         self._loop_task: asyncio.Task | None = None
         self._started = False
         self._nudge_event = asyncio.Event()
@@ -117,7 +118,9 @@ class SchedulerTimer:
 
             for reservation in reservations:
                 delay = delays.get(reservation.job.id, 0.0)
-                asyncio.create_task(self._staggered_run(reservation, delay))
+                task = asyncio.create_task(self._staggered_run(reservation, delay))
+                self._catchup_tasks.add(task)
+                task.add_done_callback(self._catchup_tasks.discard)
 
         # Step 4: fast-forward remaining (except AT one-shots). Delegates to
         # the shared next-run helper so EVERY+anchor jobs use the interval-grid
@@ -297,7 +300,7 @@ class SchedulerTimer:
         logger.info("scheduler_timer_started")
 
     async def stop(self) -> None:
-        """Stop the timer loop and cancel all running tasks."""
+        """Stop the timer loop and await cancellation of all owned job tasks."""
         self._started = False
         if self._loop_task is not None and not self._loop_task.done():
             self._loop_task.cancel()
@@ -305,9 +308,12 @@ class SchedulerTimer:
                 await self._loop_task
             except asyncio.CancelledError:
                 pass
-        # Cancel all running job tasks
-        for task in self._running.values():
+        job_tasks = {*self._running.values(), *self._catchup_tasks}
+        for task in job_tasks:
             if not task.done():
                 task.cancel()
+        if job_tasks:
+            await asyncio.gather(*job_tasks, return_exceptions=True)
         self._running.clear()
+        self._catchup_tasks.clear()
         logger.info("scheduler_timer_stopped")

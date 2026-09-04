@@ -40,7 +40,11 @@ def _excerpt(text: str, max_chars: int = 60) -> str:
 
 @app.command("list")
 def projects_list(
-    agent: str | None = typer.Option(None, "--agent", help="Filter by agent id"),
+    agent: str | None = typer.Option(
+        None,
+        "--agent",
+        help="Filter by the project's default agent (not a membership filter)",
+    ),
     json_output: bool = typer.Option(False, "--json", help="Emit machine-readable JSON"),
 ) -> None:
     """List projects with session counts."""

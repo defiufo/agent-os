@@ -488,12 +488,20 @@ class CuratedMemoryStore:
         else:
             self.memory_entries = entries
 
-    def _char_count(self, target: str) -> int:
+    def char_count(self, target: str) -> int:
+        """Return the total character count of formatted entries for *target*."""
         entries = self.entries_for(target)
         return len(ENTRY_DELIMITER.join(entries)) if entries else 0
 
-    def _char_limit(self, target: str) -> int:
+    def char_limit(self, target: str) -> int:
+        """Return the configured character limit for *target*."""
         return self.user_char_limit if target == "user" else self.memory_char_limit
+
+    def _char_count(self, target: str) -> int:
+        return self.char_count(target)
+
+    def _char_limit(self, target: str) -> int:
+        return self.char_limit(target)
 
     @staticmethod
     def _sanitize_entries_for_snapshot(entries: list[str], filename: str) -> list[str]:

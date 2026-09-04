@@ -267,6 +267,9 @@ class ServiceContainer:
     task_runtime: Any = None
     heartbeat_loop: Any = None
     heartbeat_watcher: Any = None
+    log_retention_sweeper: Any = None
+    log_retention_task: asyncio.Task | None = None
+    otlp_trace_sink: Any = None
     _compaction_listener_remove: Callable[[], None] | None = None
     turn_hooks: Sequence[Any] | None = None
     compaction_hooks: Sequence[Any] | None = None
@@ -285,6 +288,26 @@ class ServiceContainer:
         an in-flight cron job or heartbeat tick can drive TurnRunner ->
         TurnCaptureService.capture_turn against an already-closed store.
         """
+        if self.log_retention_task is not None:
+            self.log_retention_task.cancel()
+            try:
+                await self.log_retention_task
+            except asyncio.CancelledError:
+                pass
+            except Exception:
+                pass
+            self.log_retention_task = None
+
+        if self.otlp_trace_sink is not None:
+            try:
+                from agentos.observability.trace import unregister_trace_sink
+
+                unregister_trace_sink(self.otlp_trace_sink)
+                await self.otlp_trace_sink.close()
+            except Exception:
+                pass
+            self.otlp_trace_sink = None
+
         remove_compaction_listener = getattr(self, "_compaction_listener_remove", None)
         if callable(remove_compaction_listener):
             try:
@@ -1619,6 +1642,29 @@ async def build_services(
                 log.info("build_services.pricing_cache_ready", count=price_count)
             except Exception as e:
                 log.warning("build_services.pricing_cache_failed", error=str(e))
+    elif config.llm.provider == "surplus":
+        # Surplus publishes an unauthenticated marketplace catalog carrying
+        # per-token rates that move with seller competition, so the boot fetch
+        # doubles as the price seed. Failure is non-fatal; static capability
+        # fallbacks remain.
+        try:
+            catalog_data = await asyncio.wait_for(
+                model_catalog.fetch_surplus(proxy),
+                timeout=5.0,
+            )
+            log.info("build_services.model_catalog_ready", count=len(model_catalog))
+        except Exception as e:
+            log.warning("build_services.model_catalog_failed", error=str(e))
+        else:
+            # Reuse the same response for usage estimates so the first completed
+            # turn does not issue a duplicate synchronous catalog request.
+            try:
+                from agentos.engine.pricing import seed_surplus_price_cache
+
+                price_count = seed_surplus_price_cache(catalog_data)
+                log.info("build_services.pricing_cache_ready", count=price_count)
+            except Exception as e:
+                log.warning("build_services.pricing_cache_failed", error=str(e))
 
     # ── Tool registry ───────────────────────────────────────────────
     if tool_registry is None:
@@ -1890,6 +1936,57 @@ async def build_services(
     # ── MCP discovery (boot order 22) ───────────────────────────────
     await _discover_configured_mcp_servers(config, tool_registry)
 
+    # ── Observability: OTLP trace export & log retention sweeper ────
+    otlp_trace_sink = None
+    if (
+        getattr(config, "observability", None)
+        and config.observability.otlp_enabled
+        and config.observability.otlp_endpoint
+    ):
+        try:
+            from agentos import __version__
+            from agentos.observability.otlp import OtlpTraceSink
+            from agentos.observability.trace import register_trace_sink
+
+            otlp_trace_sink = OtlpTraceSink(
+                endpoint=config.observability.otlp_endpoint,
+                headers=config.observability.otlp_headers,
+                service_name=config.observability.otlp_service_name,
+                service_version=__version__,
+            )
+            otlp_trace_sink.start()
+            register_trace_sink(otlp_trace_sink)
+            log.info(
+                "build_services.otlp_trace_sink_registered",
+                endpoint=config.observability.otlp_endpoint,
+            )
+        except Exception as e:
+            log.warning("build_services.otlp_trace_sink_failed", error=str(e))
+
+    log_retention_sweeper = None
+    log_retention_task = None
+    if getattr(config, "observability", None) and (
+        config.observability.log_retention_days > 0
+        or config.observability.log_retention_max_total_mb > 0
+    ):
+        try:
+            from agentos.observability.retention import LogRetentionSweeper
+            from agentos.observability.trace import default_log_dir
+
+            log_retention_sweeper = LogRetentionSweeper(
+                log_dir=default_log_dir(),
+                retention_days=config.observability.log_retention_days,
+                max_total_bytes=config.observability.log_retention_max_total_mb * 1024 * 1024,
+                sweep_interval_s=config.observability.log_retention_sweep_interval_s,
+            )
+            try:
+                log_retention_task = create_background_task(log_retention_sweeper.run_loop())
+            except RuntimeError:
+                pass
+            log.info("build_services.log_retention_sweeper_started")
+        except Exception as e:
+            log.warning("build_services.log_retention_sweeper_failed", error=str(e))
+
     svc = ServiceContainer(
         config=config,
         provider_selector=provider_selector,
@@ -1910,6 +2007,9 @@ async def build_services(
         turn_hooks=turn_hooks,
         compaction_hooks=compaction_hooks,
         tool_hooks=tool_hooks,
+        log_retention_sweeper=log_retention_sweeper,
+        log_retention_task=log_retention_task,
+        otlp_trace_sink=otlp_trace_sink,
     )
     # Attach deferred callback ref so start_gateway_server can wire TurnRunner
     svc._turn_runner_ref = _turn_runner_ref  # type: ignore[attr-defined]
@@ -1942,7 +2042,7 @@ def build_turn_runner_from_services(
     def _standalone_lock_provider(session_key: str) -> _asyncio.Lock:
         return _standalone_locks.setdefault(session_key, _asyncio.Lock())
 
-    return TurnRunner(
+    runner = TurnRunner(
         provider_selector=svc.provider_selector,
         tool_registry=svc.tool_registry,
         session_manager=svc.session_manager,
@@ -1962,6 +2062,11 @@ def build_turn_runner_from_services(
         compaction_hooks=getattr(svc, "compaction_hooks", None),
         tool_hooks=getattr(svc, "tool_hooks", None),
     )
+    ref = getattr(svc, "_turn_runner_ref", None)
+    if isinstance(ref, list):
+        ref.clear()
+        ref.append(runner)
+    return runner
 
 
 async def start_gateway_server(
@@ -2080,9 +2185,6 @@ async def start_gateway_server(
         config=config,
         diagnostics_state=diagnostics_state,
     )
-    # Patch deferred callback so memory writes refresh TurnRunner snapshots
-    if hasattr(svc, "_turn_runner_ref"):
-        svc._turn_runner_ref.append(turn_runner)  # type: ignore[attr-defined]
 
     # Lazy ref for channel_manager — cron handler captures it via closure,
     # populated after channel_manager is constructed below.

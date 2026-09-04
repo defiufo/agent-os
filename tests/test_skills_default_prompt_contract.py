@@ -29,6 +29,8 @@ GMGN_DEFAULTS = {
     "gmgn-swap",
     "gmgn-token",
     "gmgn-track",
+    "gmgn-wallet-analysis",
+    "gmgn-wallet-score",
 }
 DEFAULTS = (
     {
@@ -51,6 +53,7 @@ DEFAULTS = (
         "poolsdotfun-token-launcher",
         "pptx",
         "robinhood-agentic-trading",
+        "robinhood-chain-stocks",
         "robinhood-rwa-addresses",
         "seedance-2-prompt",
         "senior-unilp-manager",

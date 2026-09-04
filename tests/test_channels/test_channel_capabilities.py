@@ -8,6 +8,8 @@ import pytest
 
 from agentos.artifacts import ArtifactStore
 from agentos.channels.artifact_delivery import (
+    _named_artifact_delivery_path,
+    _safe_delivery_leaf,
     can_deliver_channel_files,
     deliver_artifacts_as_channel_files,
     strip_delivered_artifact_image_references,
@@ -479,6 +481,92 @@ async def test_artifact_delivery_preserves_fallback_on_structured_failure(
     )
 
     assert undelivered == [ref.to_dict()]
+
+
+@pytest.mark.parametrize("invalid_name", ["", "   ", "/", ".", "..", "///"])
+def test_named_artifact_delivery_path_empty_or_dot_leaf(tmp_path: Path, invalid_name: str) -> None:
+    source = tmp_path / "source_data.bin"
+    source.write_bytes(b"sample artifact content")
+
+    with _named_artifact_delivery_path(source, invalid_name) as delivery_path:
+        assert delivery_path.is_file()
+        assert not delivery_path.is_dir()
+        assert delivery_path.read_bytes() == b"sample artifact content"
+        assert delivery_path.name == "source_data.bin"
+
+
+@pytest.mark.parametrize(
+    ("filename", "source_name", "expected"),
+    [
+        ("report.pdf", "source.bin", "report.pdf"),
+        ("path/to/report.pdf", "source.bin", "report.pdf"),
+        ("", "source.bin", "source.bin"),
+        ("   ", "source.bin", "source.bin"),
+        ("/", "source.bin", "source.bin"),
+        (".", "source.bin", "source.bin"),
+        ("..", "source.bin", "source.bin"),
+        ("...", "source.bin", "source.bin"),
+        ("///", "source.bin", "source.bin"),
+        ("", "..", "artifact"),
+        ("..", "", "artifact"),
+        (".", ".", "artifact"),
+    ],
+)
+def test_safe_delivery_leaf_exact_mapping(filename: str, source_name: str, expected: str) -> None:
+    source = Path(source_name)
+    assert _safe_delivery_leaf(filename, source) == expected
+
+
+@pytest.mark.asyncio
+async def test_artifact_delivery_succeeds_with_dot_dot_filename(tmp_path: Path) -> None:
+    store = ArtifactStore(tmp_path)
+    ref = store.publish_bytes(
+        b"content",
+        session_id="session-1",
+        session_key="agent:main:channel:session-1",
+        name="..",
+        mime="text/plain",
+        source="test",
+    )
+    assert ref.name == "artifact"
+
+    delivered_files: list[str] = []
+
+    class SuccessFileChannel:
+        capability_profile = ChannelCapabilityProfile(
+            channel_type="files",
+            native_file_upload=True,
+            media=True,
+        )
+
+        async def send_file(self, channel_id: str, file_path: str) -> ChannelSendResult:
+            p = Path(file_path)
+            assert p.is_file()
+            assert p.name == "artifact"
+            delivered_files.append(file_path)
+            return ChannelSendResult.sent(
+                capability=ChannelCapabilities.NATIVE_FILE_UPLOAD,
+                target_id=channel_id,
+            )
+
+    msg = IncomingMessage(
+        sender_id="u1",
+        channel_id="c1",
+        content="",
+        metadata={"is_group": False},
+    )
+    config = SimpleNamespace(attachments=SimpleNamespace(media_root=str(tmp_path)))
+
+    undelivered = await deliver_artifacts_as_channel_files(
+        SuccessFileChannel(),
+        msg,
+        [ref.to_dict()],
+        config,
+    )
+
+    assert undelivered == []
+    assert len(delivered_files) == 1
+    assert Path(delivered_files[0]).name == "artifact"
 
 
 def test_discord_profile_and_inbound_group_metadata() -> None:

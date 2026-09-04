@@ -279,6 +279,8 @@ def _sensitive_media_url_block(tool_name: str, url: str) -> dict | None:
 async def _fetch_image_url(url: str) -> tuple[bytes, str]:
     import httpx
 
+    from agentos.tools.ssrf_client import ssrf_guarded_client
+
     def _check_image_url(candidate_url: str) -> None:
         marker = _sensitive_media_url_block("image", candidate_url)
         if marker is not None:
@@ -293,30 +295,49 @@ async def _fetch_image_url(url: str) -> tuple[bytes, str]:
             raise ToolError(str(exc)) from exc
 
     try:
-        async with httpx.AsyncClient(
+        async with ssrf_guarded_client(
             timeout=30.0, follow_redirects=False, trust_env=_trust_env()
         ) as client:
             current_url = url
+            resp: httpx.Response | None = None
             for _redirect_count in range(_MAX_REDIRECTS + 1):
                 _check_image_url(current_url)
-                resp = await client.get(current_url)
+                resp = await client.send(
+                    client.build_request("GET", current_url), stream=True
+                )
                 if resp.status_code not in {301, 302, 303, 307, 308}:
                     break
                 location = resp.headers.get("location")
+                await resp.aclose()
                 if not location:
-                    break
+                    # A redirect with no Location is a dead end: nothing to
+                    # follow, and the body was just closed. Falling through
+                    # leaves the reader on a closed 3xx stream, which reports
+                    # httpx's generic error instead of the hop that broke.
+                    raise ToolError(f"Redirect response from {current_url} missing Location header")
                 current_url = urljoin(str(resp.url), location)
             else:
                 raise ToolError(f"Too many redirects (>{_MAX_REDIRECTS})")
-            resp.raise_for_status()
-            image_bytes = resp.content
+            assert resp is not None
+            try:
+                resp.raise_for_status()
+                # Stream the body and stop at the size limit so an oversized
+                # response is never buffered fully into memory; checking
+                # len(resp.content) after the download defeats the limit.
+                chunks: list[bytes] = []
+                total = 0
+                async for chunk in resp.aiter_bytes(65_536):
+                    chunks.append(chunk)
+                    total += len(chunk)
+                    if total > _IMAGE_SIZE_LIMIT:
+                        raise ToolError("Image exceeds 20MB size limit")
+                image_bytes = b"".join(chunks)
+            finally:
+                await resp.aclose()
     except ToolError:
         raise
     except Exception as exc:
         raise ToolError(f"Failed to fetch image from URL: {exc}") from exc
-
-    if len(image_bytes) > _IMAGE_SIZE_LIMIT:
-        raise ToolError("Image exceeds 20MB size limit")
 
     # Detect format from content-type or URL extension
     content_type = resp.headers.get("content-type", "")

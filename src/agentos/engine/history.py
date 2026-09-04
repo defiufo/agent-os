@@ -249,6 +249,7 @@ def reconstruct_messages_from_entry(
                     id=tool_use_id,
                     name=name,
                     input=_coerce_tool_input(seg.get("input")),
+                    thought_signature=seg.get("thought_signature") or seg.get("thoughtSignature"),
                 )
             )
         elif seg_type == "tool_result":

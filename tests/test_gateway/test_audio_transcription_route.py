@@ -63,6 +63,20 @@ def test_audio_transcription_route_requires_token_header() -> None:
     assert fake.requests == []
 
 
+def test_audio_transcription_route_rejects_wrong_token() -> None:
+    fake = _FakeProvider()
+    client = _client(fake)
+
+    response = client.post(
+        "/api/audio/transcribe",
+        headers={"Authorization": "Bearer nope"},
+        files={"file": ("voice.webm", b"spoken", "audio/webm")},
+    )
+
+    assert response.status_code == 401
+    assert fake.requests == []
+
+
 def test_audio_transcription_route_transcribes_multipart_audio() -> None:
     fake = _FakeProvider()
     client = _client(fake)

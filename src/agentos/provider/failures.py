@@ -33,6 +33,7 @@ class ProviderRecoveryAction(StrEnum):
 
 _OPENAI_COMPAT_PROVIDERS = {
     "opencap",
+    "surplus",
     "openrouter",
     "openai",
     "azure",
@@ -79,14 +80,21 @@ def _is_context_overflow(text: str) -> bool:
     return any(
         marker in text
         for marker in (
+            # OpenAI-compatible providers
             "context length",
             "context window",
             "maximum context",
             "prompt is too long",
             "input is too long",
             "input exceeds",
+            "exceeds the maximum number of tokens",
             "provider_request_budget_exhausted",
             "too many tokens",
+            # Anthropic-specific markers
+            "prompt_too_long",
+            "exceed context limit",
+            "request_too_large",
+            "request size exceeds",
         )
     )
 
@@ -101,6 +109,17 @@ def _is_policy_refusal(text: str) -> bool:
             "moderation",
             "refusal",
             "blocked by policy",
+            # Azure OpenAI / OpenAI error code and finish_reason
+            "content_filter",
+            # e.g. "flagged by content filter"
+            "content filter",
+            # Azure responsible AI policy code
+            "responsible_ai_policy",
+            # Azure OpenAI canonical phrasing; "content" and "policy" are not
+            # adjacent here, so "content policy" above does not cover it
+            "content management policy",
+            # Google Gemini block reason
+            "blocked by safety",
         )
     )
 
@@ -113,6 +132,24 @@ def _is_empty_response(raw_code: str, message: str) -> bool:
         "empty response",
         "provider returned an empty response",
     }
+
+
+def _is_insufficient_credits(text: str) -> bool:
+    return any(
+        marker in text
+        for marker in (
+            # OpenAI / OpenAI-compatible providers
+            "insufficient_quota",
+            "insufficient quota",
+            "exceeded your current quota",
+            # Anthropic
+            "billing_error",
+            "credit balance is too low",
+            # Common across gateways
+            "billing hard limit",
+            "exceeded spend limit",
+        )
+    )
 
 
 def _is_gateway_transient(text: str) -> bool:
@@ -136,6 +173,8 @@ def classify_provider_error(
         return ProviderFailureKind.POLICY_REFUSAL
     if _is_empty_response(raw_code, message):
         return ProviderFailureKind.EMPTY_RESPONSE
+    if _is_insufficient_credits(text):
+        return ProviderFailureKind.INSUFFICIENT_CREDITS
 
     if provider in _OPENAI_COMPAT_PROVIDERS:
         if status_code in {401, 403} or "invalid api key" in text or "unauthorized" in text:
@@ -160,6 +199,8 @@ def classify_provider_error(
     if provider in {"anthropic", "minimax", "minimax_cn", "minimax_global"}:
         if status_code in {401, 403} or "authentication_error" in text:
             return ProviderFailureKind.AUTH_INVALID
+        if status_code == 402 or "billing_error" in text:
+            return ProviderFailureKind.INSUFFICIENT_CREDITS
         if status_code == 429 or "rate_limit_error" in text:
             return ProviderFailureKind.RATE_LIMITED
         if status_code in _GATEWAY_TRANSIENT_STATUS_CODES or "overloaded_error" in text:
@@ -168,7 +209,7 @@ def classify_provider_error(
             return ProviderFailureKind.BAD_REQUEST
 
     if provider == "ollama":
-        if "model not found" in text or "pull" in text and "model" in text:
+        if "model not found" in text or ("pull" in text and "model" in text):
             return ProviderFailureKind.MODEL_NOT_FOUND
         if (
             "connection refused" in text
@@ -210,3 +251,19 @@ def decide_recovery_action(kind: ProviderFailureKind) -> ProviderRecoveryAction:
     if kind is ProviderFailureKind.AUTH_INVALID:
         return ProviderRecoveryAction.FAIL_CONFIG
     return ProviderRecoveryAction.SURFACE
+
+
+def is_transport_timeout(raw_code: str = "", message: str = "") -> bool:
+    """Return True when the error is specifically a request timeout.
+
+    Transport-transient covers both brief blips (connection reset, DNS hiccup)
+    and hard timeouts (upstream hangs for the full read-timeout window).
+    Timeouts are far less likely to resolve on a simple same-model retry —
+    the upstream is usually genuinely unreachable — so callers can use this
+    to cap retries more aggressively.
+    """
+    code = (raw_code or "").strip().lower()
+    msg = (message or "").strip().lower()
+    if code == "timeout":
+        return True
+    return "timed out" in msg or "request timed out" in msg

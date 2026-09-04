@@ -1,9 +1,10 @@
 """agentos.channels — Channel adapter layer.
 
-Adapters: Terminal, WebSocket, Slack, Discord, Telegram.
+Adapters: Terminal, WebSocket, Slack, Discord, Telegram, Email.
 """
 
 from agentos.channels.discord import DiscordChannel
+from agentos.channels.email import EmailChannel, EmailChannelConfig
 from agentos.channels.manager import ChannelManager
 from agentos.channels.slack import SlackChannel
 from agentos.channels.telegram import TelegramChannel, TelegramChannelConfig
@@ -37,4 +38,6 @@ __all__ = [
     "DiscordChannel",
     "TelegramChannel",
     "TelegramChannelConfig",
+    "EmailChannel",
+    "EmailChannelConfig",
 ]

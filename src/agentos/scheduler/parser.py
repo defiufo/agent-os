@@ -68,6 +68,11 @@ _PRESETS: dict[str, str] = {
 @dataclass(frozen=True)
 class CronField:
     values: frozenset[int]
+    #: Whether the field was written as a bare ``*``. Expanding ``*`` to the
+    #: full value set makes it indistinguishable from an explicit ``0-6`` /
+    #: ``1-31`` at match time, and the POSIX day-of-month/day-of-week OR rule
+    #: turns on exactly that distinction — so the parser has to carry it.
+    is_wildcard: bool = False
 
     def matches(self, value: int) -> bool:
         return value in self.values
@@ -83,13 +88,25 @@ class CronExpression:
     raw: str
 
     def matches(self, dt: datetime) -> bool:
-        return (
+        if not (
             self.minute.matches(dt.minute)
             and self.hour.matches(dt.hour)
-            and self.day_of_month.matches(dt.day)
             and self.month.matches(dt.month)
-            and self.day_of_week.matches((dt.weekday() + 1) % 7)  # Python Mon=0 → cron Sun=0
-        )
+        ):
+            return False
+
+        day_of_month_ok = self.day_of_month.matches(dt.day)
+        day_of_week_ok = self.day_of_week.matches((dt.weekday() + 1) % 7)  # Mon=0 → Sun=0
+
+        # POSIX day-of-month / day-of-week rule: when both fields are
+        # restricted (neither is a bare ``*``) the job fires when *either*
+        # matches, which is what cron, croniter and every scheduler users will
+        # compare against do. ``0 0 1,15 * 5`` means "the 1st, the 15th, or any
+        # Friday" — ANDing the two would restrict it to a 1st or 15th that also
+        # happens to be a Friday, which is almost never true.
+        if self.day_of_month.is_wildcard or self.day_of_week.is_wildcard:
+            return day_of_month_ok and day_of_week_ok
+        return day_of_month_ok or day_of_week_ok
 
 
 def _parse_field(token: str, field_name: str, names: dict[str, int] | None = None) -> CronField:
@@ -157,7 +174,9 @@ def _parse_field(token: str, field_name: str, names: dict[str, int] | None = Non
         values.remove(7)
         values.add(0)
 
-    return CronField(frozenset(values))
+    # Only an exact ``*`` is a wildcard: ``*/2`` and ``0-6`` both name a
+    # specific set of days and count as restricted, matching croniter.
+    return CronField(frozenset(values), is_wildcard=token.strip() == "*")
 
 
 def _to_int(s: str, field_name: str, lo: int, hi: int) -> int:

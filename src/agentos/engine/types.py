@@ -86,6 +86,7 @@ class ToolResultEvent:
     is_error: bool = False
     arguments: dict[str, Any] | None = None
     execution_status: ExecutionStatus | None = None
+    thought_signature: str | None = None
 
 
 @dataclass

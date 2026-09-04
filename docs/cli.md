@@ -33,6 +33,7 @@ agentos <command> --help
 | `agentos sandbox` | Inspect or change default sandbox posture. |
 | `agentos cron` | Manage scheduled AgentOS runs. |
 | `agentos cost` | Inspect usage and estimated cost. |
+| `agentos cost savings` | Report what the Pilot Router saved against the priciest configured tier. |
 | `agentos context` | Show the fixed per-request context cost and what each tool profile would cost. |
 | `agentos diagnostics` | Enable or disable runtime diagnostics logging. |
 | `agentos replay` | Replay a recorded turn from the decision log. |
@@ -355,8 +356,8 @@ agentos providers status
 failover circuit-breaker state (`closed`, `half_open`, or `open (42s)`); see
 [`providers-and-models.md`](providers-and-models.md#provider-health-circuit-breaker).
 
-Provider-specific setup examples, including OpenCAP, live in
-[`providers-and-models.md`](providers-and-models.md).
+Provider-specific setup examples, including OpenCAP and Surplus Intelligence,
+live in [`providers-and-models.md`](providers-and-models.md).
 
 Search:
 
@@ -391,7 +392,7 @@ reachable. See [`x-search.md`](x-search.md).
 
 Channels:
 
-Built-in channel types are `discord`, `slack`, and `telegram`; `agentos
+Built-in channel types are `discord`, `email`, `slack`, and `telegram`; `agentos
 channels types` is the authoritative catalog. On upgrade, config entries for
 retired built-in channel types are removed only after AgentOS creates the
 normal secure config backup.
@@ -402,6 +403,10 @@ agentos channels describe telegram
 agentos channels native-commands telegram
 agentos channels native-commands slack --request-url https://agent.example/slack/events
 agentos channels add telegram --name personal
+agentos channels add email --name inbox \
+  --field imap_host=imap.example.com --field imap_username=agent@example.com \
+  --field imap_password=<app-password> --field smtp_host=smtp.example.com \
+  --field from_address=agent@example.com --field allowed_senders=you@example.com
 agentos channels list
 agentos channels status
 agentos channels pairing list personal
@@ -495,9 +500,11 @@ command tells you when that is the case.
 
 Names that steer subprocess execution (`PATH`, `LD_PRELOAD`, `PYTHONPATH`,
 `EDITOR`, …) or AgentOS runtime posture (`AGENTOS_AGENT_PERMISSIONS`,
-`AGENTOS_GATEWAY_TOKEN`, `AGENTOS_STATE_DIR`, …) are refused, so this surface
-cannot be used to widen what the agent is allowed to do. Edit
-`~/.agentos/.env` by hand if you genuinely need one of them. Variables already
+`AGENTOS_GATEWAY_TOKEN`, `AGENTOS_STATE_DIR`, …) or outbound routing
+(`HTTP_PROXY`, `AGENTOS_LLM_PROXY`, `AGENTOS_TRUST_ENV`, … — proxy names in
+any casing) are refused, so this surface cannot be
+used to widen what the agent is allowed to do. Edit `~/.agentos/.env` by hand
+if you genuinely need one of them. Variables already
 set that way keep working; only writing through AgentOS is gated.
 
 If `agentos env list` reports a variable as coming from `process env`, the
@@ -620,7 +627,9 @@ agentos projects delete <project-id>               # sessions survive, detached
 ```
 
 A project groups chat sessions across agents and carries a free-form
-**knowledge** text (capped at 32,000 characters). Every session in the project
+**knowledge** text (capped at 24,000 characters — the same ceiling the
+per-turn injection applies, so everything that saves reaches the prompt in
+full). Every session in the project
 gets that knowledge injected into its system prompt as a `Project Knowledge`
 block — edit it and the next turn of every member session picks it up.
 Sessions of any agent can join the same project (the `--agent` on `create`
@@ -630,7 +639,11 @@ Web UI has a "New chat in project" button), and deleting a project never
 deletes sessions: they just detach and stop receiving the knowledge. Agents can manage projects from prompting through the
 `projects_create` / `projects_list` / `projects_update` /
 `projects_move_session` tools, and `session_search scope=project` searches
-only sibling sessions of the calling session's project.
+only sibling sessions of the calling session's project. The tools are scoped
+to the calling session: `projects_update` edits only the session's own
+project, `projects_list` returns knowledge text only for that project, and
+`projects_move_session` moves only the calling session — everything else
+stays on the CLI/Web UI surface.
 
 Read: [`sessions.md`](sessions.md)
 
@@ -639,7 +652,10 @@ Read: [`sessions.md`](sessions.md)
 ```sh
 agentos memory status
 agentos memory index
-agentos memory list
+agentos memory list --source all
+agentos memory ingest /path/to/docs
+agentos memory curated get --target memory
+agentos memory curated add "Important project convention"
 agentos memory search "preference"
 agentos memory show <path>
 agentos memory raw-fallbacks list
@@ -795,6 +811,7 @@ Read:
 agentos context
 agentos context --json
 agentos cost
+agentos cost savings
 agentos diagnostics status
 agentos diagnostics on
 agentos diagnostics off
@@ -831,13 +848,53 @@ agentos cost --export /path/to/export.csv
 | `--skill` | Filter by skill name. |
 | `--export` | Path to export results (JSON/CSV). |
 
+### `agentos cost savings`
+
+`agentos cost` answers "what did I spend"; `agentos cost savings` answers "what
+did the [Pilot Router](features/agentos-router.md) save me". It reads the local
+decision log (`~/.agentos/logs/decisions-*.jsonl`) rather than the gateway, so
+it works with the gateway stopped:
+
+```sh
+agentos cost savings                                  # summary + per-route table
+agentos cost savings --json
+agentos cost savings --csv
+agentos cost savings --start-date 2026-08-01 --end-date 2026-08-31
+agentos cost savings --pdf ~/pilot-router-savings.pdf
+```
+
+| Option | Purpose |
+| --- | --- |
+| `--pdf` | Write a branded, shareable PDF report to this path. |
+| `--json` | Emit machine-readable JSON. |
+| `--csv` | Emit machine-readable CSV, one row per route pair. |
+| `--start-date` | Filter by start date (YYYY-MM-DD, UTC, inclusive). |
+| `--end-date` | Filter by end date (YYYY-MM-DD, UTC, inclusive). |
+| `--log-dir` | Read a decision-log directory other than `~/.agentos/logs`. |
+
+**Read the number correctly.** The baseline is *the most expensive model
+configured in `[router.tiers]`* — what every routed turn would have cost had it
+gone to your top tier — and not the model the request arrived with. Only input
+tokens are priced, at list rates, so the figure is a floor rather than a
+full-turn saving. The report covers routing alone: tool-result projection,
+short-reply enforcement, prompt-cache hits and thinking mode are excluded, even
+though the decision log carries them too. The `Requested` column names the
+model the turn asked for, which is *not* the price comparison — a turn can be
+routed back onto the requested model and still show a saving, because the top
+tier is dearer than both.
+
+Turns are logged only when the decision log is being written, so the window
+starts at your oldest retained `decisions-*.jsonl` file.
+
 Use diagnostics and replay when you need to understand why a turn behaved a
-certain way.
+certain way. For Prometheus metrics (`/metrics`), OTLP trace export, and log retention
+settings under `[observability]`, see [`configuration.md`](configuration.md#observability).
 
 Read:
 
 - [`usage-and-cost.md`](usage-and-cost.md)
 - [`diagnostics-and-replay.md`](diagnostics-and-replay.md)
+- [`configuration.md`](configuration.md)
 
 ## MCP Server Bridge
 

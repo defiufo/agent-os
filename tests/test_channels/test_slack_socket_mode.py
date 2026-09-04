@@ -20,8 +20,11 @@ def _mk(**kwargs: Any) -> SlackChannel:
 
 
 class _FakeResp:
-    def __init__(self, payload: dict[str, Any]) -> None:
+    def __init__(self, payload: dict[str, Any], status_code: int = 200) -> None:
         self._payload = payload
+        # Outbound Slack calls go through ``retry_request``, which inspects
+        # the status before handing the response back.
+        self.status_code = status_code
 
     def raise_for_status(self) -> None:
         return None

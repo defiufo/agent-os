@@ -652,3 +652,17 @@ async def test_publish_artifact_tool_rejects_missing_workspace_and_escape(tmp_pa
             await publish_artifact(path="../outside.txt")
     finally:
         current_tool_context.reset(token)
+
+
+@pytest.mark.parametrize("unsafe_name", ["..", "...", "../..", "   ..   ", ".", "", "////", "./."])
+def test_artifact_store_sanitizes_dot_and_empty_filenames(tmp_path: Path, unsafe_name: str) -> None:
+    store = ArtifactStore(tmp_path)
+    ref = store.publish_bytes(
+        b"payload",
+        session_id="session-1",
+        session_key="agent:main:webchat:session-1",
+        name=unsafe_name,
+        mime="text/plain",
+        source="publish_artifact",
+    )
+    assert ref.name == "artifact"

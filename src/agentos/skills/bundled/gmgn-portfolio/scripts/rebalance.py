@@ -8,7 +8,8 @@ mix. Does not place trades.
 Usage:
   python rebalance.py --wallet <addr> --chain sol --targets "SOL:50,USDC:30,BONK:20"
   python rebalance.py --holdings-file holdings.json --targets "SOL:50,USDC:50"
-  gmgn-cli portfolio holdings --chain sol --wallet <addr> --raw | python rebalance.py --targets equal
+  gmgn-cli portfolio holdings --chain sol --wallet <addr> --raw | \
+    python rebalance.py --targets equal
 """
 
 from __future__ import annotations
@@ -19,7 +20,6 @@ import subprocess
 import sys
 from dataclasses import dataclass
 from typing import Any
-
 
 KNOWN_CHAINS = ("sol", "bsc", "base", "eth", "robinhood", "arc", "stable")
 
@@ -132,7 +132,14 @@ def extract_holdings(payload: Any) -> list[Holding]:
         balance = _as_float(item.get("balance"))
         if usd_value <= 0:
             continue
-        out.append(Holding(symbol=symbol, address=address, usd_value=usd_value, balance=balance))
+        out.append(
+            Holding(
+                symbol=symbol,
+                address=address,
+                usd_value=usd_value,
+                balance=balance,
+            )
+        )
     return out
 
 
@@ -266,7 +273,9 @@ def load_payload(args: argparse.Namespace) -> Any:
             "desc",
             "--raw",
         ]
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=45, check=False)
+        result = subprocess.run(
+            cmd, capture_output=True, text=True, timeout=45, check=False
+        )
         if result.returncode != 0:
             message = (result.stderr or result.stdout or "gmgn-cli holdings failed").strip()
             raise RuntimeError(message)
@@ -285,9 +294,18 @@ def build_parser() -> argparse.ArgumentParser:
         default="equal",
         help='e.g. "SOL:50,USDC:30,BONK:20" or "equal" for equal-weight baseline',
     )
-    parser.add_argument("--tolerance", type=float, default=5.0, help="hold band in percentage points")
-    parser.add_argument("--limit", type=int, default=50, help="holdings page size for live fetch")
-    parser.add_argument("--holdings-file", default="", help="JSON fixture or '-' for stdin")
+    parser.add_argument(
+        "--tolerance",
+        type=float,
+        default=5.0,
+        help="hold band in percentage points",
+    )
+    parser.add_argument(
+        "--limit", type=int, default=50, help="holdings page size for live fetch"
+    )
+    parser.add_argument(
+        "--holdings-file", default="", help="JSON fixture or '-' for stdin"
+    )
     return parser
 
 

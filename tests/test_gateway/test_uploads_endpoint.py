@@ -521,6 +521,34 @@ def test_upload_route_rejects_oversize_text_family() -> None:
     assert response.json()["code"] == "TOO_LARGE"
 
 
+def test_upload_route_rejects_wrong_token_without_middleware() -> None:
+    """The upload handler itself rejects a mismatched bearer token.
+
+    AuthMiddleware is the primary HTTP gate; this covers the in-route check
+    that still runs if the handler is registered without that middleware.
+    """
+    pytest.importorskip("starlette.testclient")
+    from starlette.applications import Starlette
+    from starlette.testclient import TestClient
+
+    from agentos.gateway.config import AuthConfig, GatewayConfig
+    from agentos.gateway.uploads import UploadStore, register_upload_routes
+
+    config = GatewayConfig(auth=AuthConfig(mode="token", token="secret"))
+    store = UploadStore(marker_dir=None, ttl_seconds=600, max_file_bytes=30 * 1024 * 1024)
+    app = Starlette(debug=False)
+    register_upload_routes(app, config=config, store=store)
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/api/v1/files/upload",
+            headers={"Authorization": "Bearer nope"},
+            files={"file": ("x.pdf", b"%PDF-1.4\n", "application/pdf")},
+        )
+    assert response.status_code == 401
+    assert response.json()["code"] == "UNAUTHORIZED"
+
+
 def test_upload_unauthenticated_rejected() -> None:
     """The HTTP route returns 401 when no token is supplied (auth=token mode).
 

@@ -290,3 +290,139 @@ def test_new_transient_status_codes_match_via_text(message: str) -> None:
         classify_provider_error("openrouter", None, message=message)
         is ProviderFailureKind.PROVIDER_OVERLOADED
     )
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "model not found",
+        "model 'llama3' not found, try pulling it first",
+        "pull the model first",
+    ],
+)
+def test_ollama_missing_model_messages_classify_as_model_not_found(message: str) -> None:
+    assert (
+        classify_provider_error("ollama", None, message=message)
+        is ProviderFailureKind.MODEL_NOT_FOUND
+    )
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "pull failed",
+        "model registry unavailable",
+    ],
+)
+def test_ollama_partial_pull_model_matches_do_not_classify_as_model_not_found(
+    message: str,
+) -> None:
+    assert (
+        classify_provider_error("ollama", None, message=message)
+        is not ProviderFailureKind.MODEL_NOT_FOUND
+    )
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "connection refused",
+        "connection error",
+        "request error",
+        "timeout",
+    ],
+)
+def test_ollama_transport_messages_classify_as_transport_transient(message: str) -> None:
+    assert (
+        classify_provider_error("ollama", None, message=message)
+        is ProviderFailureKind.TRANSPORT_TRANSIENT
+    )
+
+
+@pytest.mark.parametrize(
+    ("provider", "status_code", "raw_code", "message"),
+    [
+        # Azure OpenAI: canonical content-management-policy wording. Note the words
+        # "content" and "policy" are not adjacent, so the pre-existing
+        # "content policy" marker never fired on this message.
+        (
+            "azure",
+            400,
+            "content_filter",
+            "The response was filtered due to the prompt triggering Azure OpenAI's "
+            "content management policy. Please modify your prompt and retry.",
+        ),
+        # OpenAI/Azure error code and finish_reason.
+        ("openai", 400, "content_filter", "The response was filtered"),
+        # Azure responsible AI policy code.
+        (
+            "azure",
+            400,
+            "responsible_ai_policy",
+            "Your request was rejected by the responsible_ai_policy filter.",
+        ),
+        # "content filter" spelled with a space, e.g. "flagged by content filter".
+        ("openai", 400, "", "This prompt was flagged by content filter."),
+        # Google Gemini block reason.
+        ("gemini", 400, "", "Candidate blocked by safety settings."),
+    ],
+)
+def test_provider_specific_policy_markers_classify_as_policy_refusal(
+    provider: str,
+    status_code: int,
+    raw_code: str,
+    message: str,
+) -> None:
+    assert (
+        classify_provider_error(provider, status_code, raw_code=raw_code, message=message)
+        is ProviderFailureKind.POLICY_REFUSAL
+    )
+
+
+@pytest.mark.parametrize(
+    ("provider", "status_code", "raw_code", "message", "expected"),
+    [
+        # A plain bad request must not be swept up by the new markers.
+        (
+            "openai",
+            400,
+            "invalid_request_error",
+            "Unsupported parameter: 'max_tokens'.",
+            ProviderFailureKind.UNSUPPORTED_FEATURE,
+        ),
+        (
+            "azure",
+            400,
+            "invalid_request_error",
+            "Missing required parameter: 'messages'.",
+            ProviderFailureKind.BAD_REQUEST,
+        ),
+        # Rate limits stay rate limits.
+        (
+            "openai",
+            429,
+            "rate_limit_exceeded",
+            "Rate limit reached for gpt-4o.",
+            ProviderFailureKind.RATE_LIMITED,
+        ),
+        # Context overflow is checked before policy refusal and stays put.
+        (
+            "openai",
+            400,
+            "context_length_exceeded",
+            "This model's maximum context length is 128000 tokens.",
+            ProviderFailureKind.CONTEXT_OVERFLOW,
+        ),
+    ],
+)
+def test_policy_markers_do_not_capture_unrelated_failures(
+    provider: str,
+    status_code: int,
+    raw_code: str,
+    message: str,
+    expected: ProviderFailureKind,
+) -> None:
+    assert (
+        classify_provider_error(provider, status_code, raw_code=raw_code, message=message)
+        is expected
+    )

@@ -114,9 +114,9 @@ class SpellingDivergence:
 def _gateway_windows(
     max_output_tokens: int, context_window: int, reason: str
 ) -> ProviderWindowOverride:
-    """Bankr and OpenCAP serve the same catalog, so they override together."""
+    """Bankr, OpenCAP and Surplus resell the same bare ids, so they override together."""
     return ProviderWindowOverride(
-        providers=("bankr", "opencap"),
+        providers=("bankr", "opencap", "surplus"),
         max_output_tokens=max_output_tokens,
         context_window=context_window,
         reason=reason,
@@ -324,6 +324,19 @@ MODEL_FACTS: tuple[ModelFacts, ...] = (
         price=PriceFacts(0.132, 0.429, beats_live_catalog=True),
     ),
     ModelFacts(
+        "glm-5.3",
+        max_output_tokens=131_072,
+        context_window=1_310_720,
+        price=PriceFacts(1.54, 4.84),
+    ),
+    ModelFacts(
+        "glm-5.3-flash",
+        max_output_tokens=131_072,
+        context_window=1_310_720,
+        price=PriceFacts(0.0825, 0.275),
+        supports_image=True,
+    ),
+    ModelFacts(
         "minimax-m3",
         max_output_tokens=131_072,
         context_window=1_048_576,
@@ -428,9 +441,30 @@ MODEL_FACTS: tuple[ModelFacts, ...] = (
         ),
     ),
     ModelFacts(
+        "grok-4.6",
+        max_output_tokens=450_000,
+        context_window=500_000,
+        price=PriceFacts(2.2, 6.6),
+        supports_image=True,
+    ),
+    ModelFacts(
         "kimi-k2.7-code",
         max_output_tokens=262_144,
         context_window=262_144,
+    ),
+    ModelFacts(
+        "kimi-k3",
+        max_output_tokens=943_718,
+        context_window=1_048_576,
+        price=PriceFacts(3.0, 15.0),
+        supports_image=True,
+    ),
+    ModelFacts(
+        "muse-spark-1.2",
+        max_output_tokens=943_718,
+        context_window=1_048_576,
+        price=PriceFacts(1.25, 4.25),
+        supports_image=True,
     ),
     ModelFacts(
         "gpt-5.6-luna",

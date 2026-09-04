@@ -8,7 +8,7 @@ import json
 import os
 from pathlib import Path
 from typing import Any
-from urllib.parse import parse_qsl, urlparse
+from urllib.parse import parse_qsl, unquote, urlparse
 
 import httpx
 
@@ -19,6 +19,7 @@ from agentos.search.types import SearchProviderError, SearchResult
 from agentos.tools.path_policy import reject_foreign_host_path
 from agentos.tools.registry import tool
 from agentos.tools.ssrf import assert_not_metadata_endpoint
+from agentos.tools.ssrf_client import ssrf_guarded_client, validate_metadata_only_address
 from agentos.tools.types import ToolError, UnsupportedURLSchemeError, current_tool_context
 
 
@@ -36,6 +37,17 @@ def _validate_http_url(url: str) -> None:
 
 _TEXT_BODY_LIMIT = 10_000
 _BINARY_BODY_LIMIT = 1_000_000
+# Hard ceiling on the number of response bytes http_request will buffer into
+# memory, independent of the display cap (_BINARY_BODY_LIMIT / _TEXT_BODY_LIMIT).
+# Those caps only truncate what the model sees; without a download cap, a single
+# unbounded response body (chunked encoding with no content-length, or a lying
+# content-length) is read fully into RAM via response.content, so one
+# attacker-influenced URL (search results, links inside fetched pages, user
+# input) can exhaust the process. 1 MiB covers every realistic response; the
+# display cap then decides how much of that is returned.
+_DOWNLOAD_LIMIT_BYTES = 1_000_000
+_DOWNLOAD_LIMIT_ENV = "AGENTOS_HTTP_DOWNLOAD_LIMIT"
+_STREAM_CHUNK_BYTES = 65_536
 _FETCH_DIR_NAME = ".fetch"
 
 
@@ -53,8 +65,17 @@ def _sensitive_body_marker(body: str | None) -> str | None:
 
 def _sensitive_url_marker(url: str) -> str | None:
     parsed = urlparse(url)
+    # URL userinfo is a legitimate credential carrier (RFC 3986), and the
+    # HTTP client underneath converts it into an ``Authorization: Basic``
+    # header on the wire — so a credential placed there egresses to whatever
+    # host the URL names without ever appearing in the path or query. Check
+    # both components percent-decoded: the client decodes userinfo before
+    # sending, so ``sk%2Dant-…`` reaches the wire as ``sk-ant-…``.
+    for part in (parsed.username, parsed.password):
+        if part and secret_literal_marker(unquote(part)) is not None:
+            return "sensitive_url_userinfo"
     for segment in parsed.path.split("/"):
-        if secret_literal_marker(segment) is not None:
+        if secret_literal_marker(unquote(segment)) is not None:
             return "sensitive_url_path"
     if not parsed.query:
         return None
@@ -98,6 +119,20 @@ def _is_text_response_content_type(content_type: str) -> bool:
         or normalized.endswith("+xml")
         or "json" in normalized
         or "xml" in normalized
+    )
+
+
+def _resolve_download_limit_bytes() -> int:
+    """Resolve the hard download cap from env or the built-in default."""
+    raw = os.environ.get(_DOWNLOAD_LIMIT_ENV, "").strip()
+    if not raw:
+        return _DOWNLOAD_LIMIT_BYTES
+    try:
+        value = int(raw)
+    except ValueError:
+        return _DOWNLOAD_LIMIT_BYTES
+    return (
+        min(value, _DOWNLOAD_LIMIT_BYTES) if value >= _STREAM_CHUNK_BYTES else _DOWNLOAD_LIMIT_BYTES
     )
 
 
@@ -211,60 +246,117 @@ async def http_request(
 
     content: bytes | None = body.encode() if body else None
 
-    async with httpx.AsyncClient(timeout=timeout, trust_env=_trust_env()) as client:
-        response = await client.request(
-            method=method_upper,
-            url=url,
-            headers=headers or {},
-            content=content,
+    # Metadata-only policy at connect time: http_request keeps reaching
+    # localhost and LAN services on purpose, but a rebinding domain must not be
+    # able to swap a public answer for the instance-credential endpoint between
+    # the URL check and the socket.
+    async with ssrf_guarded_client(
+        timeout=timeout,
+        trust_env=_trust_env(),
+        validator=validate_metadata_only_address,
+    ) as client:
+        response = await client.send(
+            client.build_request(
+                method=method_upper,
+                url=url,
+                headers=headers or {},
+                content=content,
+            ),
+            stream=True,
         )
+        try:
+            # Stream the body with a hard byte ceiling so an unbounded response
+            # can never be buffered fully into memory; the display caps
+            # (_BINARY_BODY_LIMIT / _TEXT_BODY_LIMIT) only decide what is
+            # returned. A timeout bounds time, not bytes: on a fast pipe
+            # gigabytes arrive inside the window, so one attacker-influenced
+            # URL can OOM the process.
+            #
+            # The whole read MUST stay inside this ``async with`` block:
+            # ``AsyncClient.__aexit__`` closes the transport pool, and once it
+            # does, ``response.aiter_bytes`` raises ``httpx.ReadError`` because
+            # the underlying socket is gone. Reviewer #509 caught this as a
+            # 100% production failure — every real request raised ReadError
+            # after the previous layout exited the block before iterating.
+            download_limit = _resolve_download_limit_bytes()
+            total = 0
+            chunks: list[bytes] = []
+            download_capped = False
+            stream_truncated = False
+            try:
+                async for chunk in response.aiter_bytes(_STREAM_CHUNK_BYTES):
+                    chunks.append(chunk)
+                    total += len(chunk)
+                    if total >= download_limit:
+                        download_capped = True
+                        break
+            except httpx.RemoteProtocolError:
+                # Server dropped the connection mid-body (e.g. truncated
+                # chunked response). Return what we got rather than crashing
+                # the whole tool call.
+                stream_truncated = True
+            raw_body = b"".join(chunks)
+            # Snapshot response metadata while the connection is still open so
+            # downstream consumers don't depend on the closed transport.
+            status_code = response.status_code
+            response_url = str(response.url)
+            response_headers = dict(response.headers)
+            response_encoding = response.encoding or "utf-8"
+            content_type = response_headers.get("content-type", "")
+        finally:
+            await response.aclose()
 
-    content_type = response.headers.get("content-type", "")
-    is_text = _is_text_response_content_type(content_type)
-    raw_body = response.content
-    should_save = output_path is not None
     from agentos.safety.injection_guard import wrap_untrusted_boundary
+
+    is_text = _is_text_response_content_type(content_type)
+    should_save = output_path is not None
 
     if should_save:
         saved_path, digest = _save_http_response_body(raw_body, output_path)
         preview = (
-            wrap_untrusted_boundary(response.text[:_TEXT_BODY_LIMIT], str(response.url))
+            wrap_untrusted_boundary(
+                raw_body[:_TEXT_BODY_LIMIT].decode(response_encoding, "replace"),
+                response_url,
+            )
             if is_text
             else None
         )
         result = {
-            "status": response.status_code,
-            "url": str(response.url),
-            "headers": dict(response.headers),
+            "status": status_code,
+            "url": response_url,
+            "headers": response_headers,
             "content_type": content_type,
             "body": None,
             "body_base64": None,
-            "body_truncated": False,
-            "body_base64_truncated": False,
+            "body_truncated": stream_truncated,
+            "body_base64_truncated": download_capped or stream_truncated,
             "body_saved": True,
             "body_omitted_reason": "saved_to_file",
             "body_preview": preview,
             "path": str(saved_path),
             "size": len(raw_body),
             "sha256": digest,
+            "download_capped": download_capped,
         }
         return json.dumps(result, ensure_ascii=False, indent=2)
 
     capped = raw_body[:_BINARY_BODY_LIMIT]
     body_base64 = base64.b64encode(capped).decode("ascii")
-    body_base64_truncated = len(raw_body) > _BINARY_BODY_LIMIT
+    body_base64_truncated = (
+        download_capped or stream_truncated or len(raw_body) > _BINARY_BODY_LIMIT
+    )
     if is_text:
-        text_body = response.text
-        body = wrap_untrusted_boundary(text_body[:_TEXT_BODY_LIMIT], str(response.url))
-        body_truncated = len(text_body) > _TEXT_BODY_LIMIT
+        text_body = raw_body.decode(response_encoding, "replace")
+        body = wrap_untrusted_boundary(text_body[:_TEXT_BODY_LIMIT], response_url)
+        body_truncated = download_capped or stream_truncated or len(text_body) > _TEXT_BODY_LIMIT
     else:
         body = None
         body_truncated = False
 
     result = {
-        "status": response.status_code,
-        "url": str(response.url),
-        "headers": dict(response.headers),
+        "status": status_code,
+        "url": response_url,
+        "headers": response_headers,
         "content_type": content_type,
         "body": body,
         "body_base64": body_base64,
@@ -274,6 +366,7 @@ async def http_request(
         "path": None,
         "size": len(raw_body),
         "sha256": hashlib.sha256(raw_body).hexdigest(),
+        "download_capped": download_capped,
     }
     return json.dumps(result, ensure_ascii=False, indent=2)
 
@@ -564,7 +657,15 @@ def _search_payload(
     payload = {
         "query": query,
         "provider": provider_name,
-        "results": [{"title": r.title, "url": r.url, "snippet": r.snippet} for r in results],
+        "results": [
+            {
+                "title": r.title,
+                "url": r.url,
+                "snippet": r.snippet,
+                "source": r.source or "",
+            }
+            for r in results
+        ],
     }
     if fallback_from:
         payload["fallback_from"] = fallback_from

@@ -347,6 +347,8 @@ class ArtifactStore:
 def _safe_filename(name: str) -> str:
     cleaned = Path(name).name.strip() or "artifact"
     cleaned = _UNSAFE_FILENAME_RE.sub("_", cleaned).strip()
+    if cleaned in (".", "..") or not cleaned.strip("."):
+        return "artifact"
     return cleaned[:160] or "artifact"
 
 

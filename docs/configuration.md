@@ -67,9 +67,18 @@ every AgentOS surface — the Web UI, the CLI, the RPC, and the agent tool:
 - AgentOS posture and state location: `AGENTOS_SENSITIVE_PATHS_DISABLED`,
   `AGENTOS_SENSITIVE_PAYLOAD_DISABLED`, `AGENTOS_REDACT_SECRETS`,
   `AGENTOS_STRIP_PROVIDER_ENV`, `AGENTOS_SHELL_DENYLIST`, `AGENTOS_SAFE_BIN_*`,
-  `AGENTOS_AGENT_PERMISSIONS`, `AGENTOS_HOOKS`, `AGENTOS_GATEWAY_TOKEN`,
-  `AGENTOS_GATEWAY_CONFIG_PATH`, `AGENTOS_STATE_DIR`, `AGENTOS_ROOT`, and the
+  `AGENTOS_AGENT_PERMISSIONS`, `AGENTOS_TRUST_ENV`, `AGENTOS_HOOKS`,
+  `AGENTOS_GATEWAY_TOKEN`, `AGENTOS_GATEWAY_CONFIG_PATH`, `AGENTOS_STATE_DIR`, `AGENTOS_ROOT`, and the
   bind settings
+- Outbound routing: `AGENTOS_LLM_PROXY`, `HTTP_PROXY`, `HTTPS_PROXY`,
+  `ALL_PROXY`, `NO_PROXY` — **in any casing**, because the libraries that read
+  these names lower-case them first, so `Http_Proxy` routes traffic exactly as
+  `HTTP_PROXY` does. `AGENTOS_LLM_PROXY` is applied to every provider client,
+  so a writable proxy name would let a surface hand each request — API key
+  header included — to a machine of its choosing. `AGENTOS_TRUST_ENV`, which
+  decides whether the ambient `*_PROXY` names are honoured at all, is refused
+  for the same reason. Configure a proxy through `llm.proxy` in the config
+  file, or export it in the shell that starts the gateway.
 
 Tools AgentOS spawns inherit most of `os.environ`, and several AgentOS guards
 are themselves read from it, so a surface that could write these names could
@@ -131,6 +140,15 @@ longer matches the file. Configuration data — `.env`, `~/.aws/credentials`,
 `grep_search` judges each matched line by the path it came from, so one search
 can span both kinds of file.
 
+`git_status`, `git_diff`, `git_log` and `git_commit` are scanned too, and always
+with the full name-driven pass. `git_diff` hands back whatever the repository
+happens to contain, a committed `.env` included, so the git arguments say
+nothing useful about what kind of content is coming back. A credential on a
+diff's `+`/`-` line — or on the `++`/`--` columns of the combined diff a
+conflicted merge produces — is masked like any other, and with the same
+non-reusable sentinel the file surfaces use, so a masked diff fed back through
+`git apply` fails loudly instead of writing a dead-looking key.
+
 ### What the outbound guard refuses
 
 `http_request`, `exec_command` and `execute_code` refuse to put credential
@@ -186,7 +204,7 @@ there is nothing to hide and a visible, diffable setting is easier to share and
 review:
 
 ```sh
-agentos config set skills.config.wiki.path /srv/wiki
+agentos config set skills.config.wiki.path /srv/wiki --config ~/.agentos/config.toml
 ```
 
 When the agent opens the skill, the values currently in effect are appended to
@@ -370,6 +388,7 @@ Onboarding-verified providers include:
 - OpenRouter
 - Bankr LLM Gateway
 - OpenCAP
+- Surplus Intelligence
 - OpenAI
 - Anthropic
 - Ollama
@@ -391,6 +410,13 @@ Read: [`providers-and-models.md`](providers-and-models.md)
 
 See [Providers and Models — OpenCAP routing](providers-and-models.md#opencap-routing)
 for the canonical setup, model catalog, routing, and pricing behavior.
+
+### Surplus Intelligence
+
+See [Providers and Models — Surplus Intelligence routing](providers-and-models.md#surplus-intelligence-routing)
+for the canonical setup, model catalog, routing, and pricing behavior. Set
+`AGENTOS_SURPLUS_LIVE_PRICING=0` to use static price estimates instead of its
+live marketplace catalog.
 
 ### Ollama plain-text mode
 
@@ -744,6 +770,14 @@ Supported transports are `stdio`, `sse`, and `streamable_http`. The MCP SDK is
 included in the standard AgentOS installation, so Streamable HTTP and OAuth work
 without installing an additional package extra.
 
+The HTTP transports accept `http://` and `https://` URLs only, and both connect
+through the same SSRF guard the built-in HTTP tools use. `http://localhost:PORT`
+and LAN-hosted servers keep working — the guard blocks cloud metadata endpoints
+(`169.254.169.254` and friends), which serve instance credentials and are never
+a valid MCP target. The check runs against the address the socket actually
+dials, so a short-TTL DNS name cannot answer safely for the check and with the
+metadata address for the connection.
+
 OAuth access and refresh tokens are not written to `config.toml`. AgentOS keeps
 them in a server-scoped JSON file under the configured state directory with
 file mode `0600` inside a `0700` directory on POSIX systems. On Windows, the
@@ -967,9 +1001,26 @@ editing the config file directly. The state file
 e.g. `cli`, `webui`) for throttling; delete it to force a re-check. To silence the notices
 for a single run/session without changing config, set `AGENTOS_NO_UPDATE_NOTICE=1`.
 
-Related: `agentos upgrade` (the primary upgrade path), the version-skew policy,
-and the `AGENTOS_ALLOW_VERSION_SKEW=1` escape hatch are documented in the
-[README Upgrade section](../README.md#upgrade).
+## Observability
+
+AgentOS provides Prometheus metrics exposition, OpenTelemetry (OTLP) trace export, and automatic log retention pruning under the `[observability]` table:
+
+```toml
+[observability]
+metrics_enabled = true
+metrics_path = "/metrics"
+otlp_enabled = false
+otlp_endpoint = "http://localhost:4318"
+otlp_headers = {}
+otlp_service_name = "agentos"
+log_retention_days = 14
+log_retention_max_total_mb = 500
+log_retention_sweep_interval_s = 3600.0
+```
+
+- **Prometheus Metrics**: `metrics_enabled` (default `true`) exposes Prometheus metrics at `metrics_path` (default `"/metrics"`). Core metrics (`agentos_queue_depth`, `in_flight_turns_total`, `turn_cancellations_total`, `queue_full_errors_total`) are exported with bounded cardinality.
+- **OTLP Trace Export**: `otlp_enabled` (default `false`) sends trace events as OTLP spans over HTTP to `otlp_endpoint` (e.g. OpenTelemetry Collector).
+- **Log Retention**: `log_retention_days` (TTL) and `log_retention_max_total_mb` (total size cap) bound disk growth in `~/.agentos/logs`. Background sweeps run every `log_retention_sweep_interval_s`.
 
 ## Raw Config Editing
 

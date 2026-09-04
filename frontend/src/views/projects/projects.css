@@ -34,6 +34,24 @@
   flex-shrink: 0;
 }
 
+/* Mobile: stack the title block above full-width actions, the same way the
+   overview/control headers do — side-by-side squeezes the subtitle into a
+   narrow column while the buttons sit on top of it. */
+@media (max-width: 700px) {
+  .proj-stage__header {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+
+  .proj-stage__actions {
+    width: 100%;
+  }
+
+  .proj-stage__actions [data-slot='button'] {
+    min-height: 2.75rem;
+  }
+}
+
 .proj-refresh-spin {
   animation: proj-spin 0.9s linear infinite;
 }

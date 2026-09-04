@@ -16,7 +16,7 @@ class _Response:
         status_code: int = 200,
     ) -> None:
         self._json_data = json_data or {}
-        self.content = content
+        self._content = content
         self.text = content.decode("utf-8", errors="replace")
         self.status_code = status_code
 
@@ -26,6 +26,16 @@ class _Response:
     def raise_for_status(self) -> None:
         if self.status_code >= 400:
             raise RuntimeError(f"HTTP {self.status_code}")
+
+    async def aiter_bytes(self, chunk_size: int = 64 * 1024) -> Any:
+        pos = 0
+        while pos < len(self._content):
+            end = pos + chunk_size
+            yield self._content[pos:end]
+            pos = end
+
+    async def aclose(self) -> None:
+        return None
 
 
 class _AsyncClient:
@@ -51,7 +61,16 @@ class _AsyncClient:
     async def __aexit__(self, *args: Any) -> None:
         return None
 
+    def build_request(
+        self, method: str, url: str, **kwargs: Any
+    ) -> tuple[str, dict[str, Any]]:
+        return (url, kwargs)
+
     async def get(self, url: str, **kwargs: Any) -> _Response:
+        return await self.send((url, kwargs), stream=False)
+
+    async def send(self, request: tuple[str, dict[str, Any]], stream: bool = False) -> _Response:
+        url, kwargs = request
         self.requests.append((url, kwargs))
         if "/git/trees/" in url:
             return _Response(json_data={"tree": self.tree_entries, "truncated": False})
@@ -191,3 +210,65 @@ def test_frontmatter_handles_crlf_line_endings() -> None:
 
     skill_md = "---\r\ndescription: On-chain data\r\n---\r\n# Body\r\n"
     assert _frontmatter_field(skill_md, "description") == "On-chain data"
+
+
+@pytest.mark.asyncio
+async def test_fetch_github_blob_over_per_blob_cap_is_rejected(monkeypatch) -> None:
+    """A single oversized blob must not be buffered fully into RAM.
+
+    A hostile repo can return a 60 MB blob for what should be a small skill
+    file. The streaming fetch must stop near the per-blob cap and return None
+    instead of buffering the full body.
+    """
+    import httpx
+
+    from agentos.skills.hub import github as gh_mod
+
+    class _OversizedAsyncClient(_AsyncClient):
+        async def send(self, request: tuple[str, dict[str, Any]], stream: bool = False) -> Any:
+            url, _ = request
+            if "/git/trees/" in url:
+                return await _AsyncClient.send(self, request, stream=stream)
+            return _Response(content=b"x" * (60 * 1024 * 1024))
+
+    monkeypatch.setattr(httpx, "AsyncClient", _OversizedAsyncClient)
+    monkeypatch.setattr(gh_mod, "_MAX_BLOB_BYTES", 1024)
+
+    bundle = await GitHubSource().fetch(
+        "https://github.com/acme/skillpack/tree/main/skills/demo"
+    )
+
+    assert bundle is None
+
+
+@pytest.mark.asyncio
+async def test_fetch_github_total_budget_blocks_after_exhausted(monkeypatch) -> None:
+    """The whole skill directory must respect a cumulative size budget.
+
+    Even when every individual blob sits under the per-blob cap, a tree of many
+    blobs must not be allowed to sum past the total budget. We craft a tree
+    with two mid-size blobs and a tiny total budget, and assert the fetch is
+    abandoned before both blobs land in RAM.
+    """
+    import httpx
+
+    from agentos.skills.hub import github as gh_mod
+
+    class _TwoBlobAsyncClient(_AsyncClient):
+        tree_entries = [
+            {"path": "skills/demo/SKILL.md", "type": "blob"},
+            {"path": "skills/demo/notes.md", "type": "blob"},
+        ]
+        raw_payloads = {
+            "skills/demo/SKILL.md": b"---\nname: demo\n---\n# body\n",
+            "skills/demo/notes.md": b"x" * 2048,
+        }
+
+    monkeypatch.setattr(httpx, "AsyncClient", _TwoBlobAsyncClient)
+    monkeypatch.setattr(gh_mod, "_MAX_TOTAL_BYTES", 200)
+
+    bundle = await GitHubSource().fetch(
+        "https://github.com/acme/skillpack/tree/main/skills/demo"
+    )
+
+    assert bundle is None

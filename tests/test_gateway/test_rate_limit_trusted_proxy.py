@@ -11,6 +11,15 @@ from agentos.gateway.config import AuthConfig, GatewayConfig, RateLimitConfig
 from agentos.gateway.middleware import RateLimitMiddleware
 
 
+def _tracked_ips(mw: RateLimitMiddleware) -> list[str]:
+    """IPs tracked in the shared ``"api"`` bucket, in LRU order.
+
+    ``_windows`` is keyed by ``(bucket, ip)`` since GET /api/approvals moved to
+    its own bucket (#569); these tests only exercise the shared bucket.
+    """
+    return [ip for bucket, ip in mw._windows if bucket == "api"]
+
+
 def _create_app(
     *,
     max_requests: int = 2,
@@ -70,10 +79,12 @@ def test_untrusted_client_cannot_bypass_rate_limit_via_x_forwarded_for() -> None
 
     # Memory check: only the peer IP was tracked, not the spoofed IPs
     mw = mw_holder[0]
-    assert "198.51.100.1" in mw._windows
-    assert "1.1.1.1" not in mw._windows
-    assert "2.2.2.2" not in mw._windows
-    assert "3.3.3.3" not in mw._windows
+    assert "198.51.100.1" in _tracked_ips(mw)
+    assert "1.1.1.1" not in _tracked_ips(mw)
+    assert "2.2.2.2" not in _tracked_ips(mw)
+    assert "3.3.3.3" not in _tracked_ips(mw)
+    assert _tracked_ips(mw) == ["198.51.100.1"]
+    # Whole-table check: the spoofed IPs created no entry in *any* bucket.
     assert len(mw._windows) == 1
 
 
@@ -104,9 +115,9 @@ def test_trusted_proxy_honors_x_forwarded_for() -> None:
         )
 
     mw = mw_holder[0]
-    assert "203.0.113.50" in mw._windows
-    assert "203.0.113.51" in mw._windows
-    assert "10.0.0.1" not in mw._windows
+    assert "203.0.113.50" in _tracked_ips(mw)
+    assert "203.0.113.51" in _tracked_ips(mw)
+    assert "10.0.0.1" not in _tracked_ips(mw)
 
 
 def test_trusted_proxy_x_forwarded_for_multiple_ips() -> None:
@@ -125,7 +136,7 @@ def test_trusted_proxy_x_forwarded_for_multiple_ips() -> None:
         assert resp.status_code == 200
 
     mw = mw_holder[0]
-    assert "203.0.113.99" in mw._windows
+    assert "203.0.113.99" in _tracked_ips(mw)
     assert len(mw._windows) == 1
 
 
@@ -142,7 +153,7 @@ def test_trusted_proxy_missing_or_blank_forwarded_for_falls_back_to_peer() -> No
         assert client.get("/api/test").status_code == 429
 
     mw = mw_holder[0]
-    assert "10.0.0.1" in mw._windows
+    assert "10.0.0.1" in _tracked_ips(mw)
 
 
 def test_max_tracked_clients_evicts_lru() -> None:
@@ -161,17 +172,17 @@ def test_max_tracked_clients_evicts_lru() -> None:
 
         mw = mw_holder[0]
         assert len(mw._windows) == 3
-        assert list(mw._windows.keys()) == ["1.1.1.1", "2.2.2.2", "3.3.3.3"]
+        assert _tracked_ips(mw) == ["1.1.1.1", "2.2.2.2", "3.3.3.3"]
 
         # Accessing 1.1.1.1 again makes 2.2.2.2 the least recently used
         client.get("/api/test", headers={"x-forwarded-for": "1.1.1.1"})
-        assert list(mw._windows.keys()) == ["2.2.2.2", "3.3.3.3", "1.1.1.1"]
+        assert _tracked_ips(mw) == ["2.2.2.2", "3.3.3.3", "1.1.1.1"]
 
         # Adding 4.4.4.4 exceeds capacity (3), so 2.2.2.2 should be evicted
         client.get("/api/test", headers={"x-forwarded-for": "4.4.4.4"})
         assert len(mw._windows) == 3
-        assert list(mw._windows.keys()) == ["3.3.3.3", "1.1.1.1", "4.4.4.4"]
-        assert "2.2.2.2" not in mw._windows
+        assert _tracked_ips(mw) == ["3.3.3.3", "1.1.1.1", "4.4.4.4"]
+        assert "2.2.2.2" not in _tracked_ips(mw)
 
 
 def test_sweep_expired_entries() -> None:
@@ -197,6 +208,6 @@ def test_sweep_expired_entries() -> None:
         client.get("/api/test", headers={"x-forwarded-for": "3.3.3.3"})
 
         # Expired entries 1.1.1.1 and 2.2.2.2 should have been swept
-        assert "1.1.1.1" not in mw._windows
-        assert "2.2.2.2" not in mw._windows
-        assert "3.3.3.3" in mw._windows
+        assert "1.1.1.1" not in _tracked_ips(mw)
+        assert "2.2.2.2" not in _tracked_ips(mw)
+        assert "3.3.3.3" in _tracked_ips(mw)

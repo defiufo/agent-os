@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
+from agentos.compat import aiosqlite
 from agentos.engine.steps.inject_time_prefix import stamp as _stamp_time_prefix
 from agentos.paths import default_agentos_home
 from agentos.session.compaction import (
@@ -86,6 +87,10 @@ def _resolve_local_tz_name() -> str:
     return "UTC"
 
 
+class ProjectUpdateConflictError(Exception):
+    """A project write lost a compare-and-swap: the row changed since read."""
+
+
 def _now_ms() -> int:
     return int(datetime.now(tz=UTC).timestamp() * 1000)
 
@@ -123,7 +128,7 @@ def _archive_dir() -> Path:
 
 
 def _safe_archive_part(value: str) -> str:
-    return re.sub(r"[^A-Za-z0-9_.-]+", "-", value).strip("-") or "session"
+    return re.sub(r"[^A-Za-z0-9_.-]+", "-", value).strip("-.") or "session"
 
 
 def _stable_json(value: Any) -> str:
@@ -624,18 +629,19 @@ class SessionManager:
     # ── Projects ─────────────────────────────────────────────────────────────
 
     PROJECT_NAME_MAX_CHARS = 200
-    PROJECT_KNOWLEDGE_MAX_CHARS = 32_000
+    # Must equal TurnRunner.PROJECT_KNOWLEDGE_INJECT_MAX_CHARS: anything
+    # accepted here is injected in full, so a larger write cap would mean
+    # text that saves fine but is silently truncated out of every turn.
+    # Rows written under the old 32k cap are grandfathered — validated only
+    # on the next write, truncated at injection until then.
+    PROJECT_KNOWLEDGE_MAX_CHARS = 24_000
 
-    def _validate_project_fields(
-        self, name: str | None, knowledge: str | None
-    ) -> None:
+    def _validate_project_fields(self, name: str | None, knowledge: str | None) -> None:
         if name is not None:
             if not name.strip():
                 raise ValueError("Project name cannot be empty")
             if len(name) > self.PROJECT_NAME_MAX_CHARS:
-                raise ValueError(
-                    f"Project name exceeds {self.PROJECT_NAME_MAX_CHARS} characters"
-                )
+                raise ValueError(f"Project name exceeds {self.PROJECT_NAME_MAX_CHARS} characters")
         if knowledge is not None and len(knowledge) > self.PROJECT_KNOWLEDGE_MAX_CHARS:
             raise ValueError(
                 f"Project knowledge exceeds {self.PROJECT_KNOWLEDGE_MAX_CHARS} characters"
@@ -670,7 +676,11 @@ class SessionManager:
         if any(p.name.casefold() == name.casefold() for p in existing):
             raise ValueError(f"Project name already exists: {name}")
         project = ProjectNode(agent_id=agent_id, name=name, knowledge=knowledge)
-        await self._storage.upsert_project(project)
+        try:
+            await self._storage.upsert_project(project)
+        except aiosqlite.IntegrityError as exc:
+            # Unique-index backstop: a concurrent create won the name race.
+            raise ValueError(f"Project name already exists: {name}") from exc
         return project.model_dump(mode="json")
 
     async def get_project(self, project_id: str) -> dict[str, Any] | None:
@@ -697,26 +707,46 @@ class SessionManager:
         project_id: str,
         name: str | None = None,
         knowledge: str | None = None,
+        expected_updated_at: int | None = None,
     ) -> dict[str, Any]:
-        """Update name and/or knowledge of an existing project."""
+        """Update name and/or knowledge of an existing project.
+
+        Only the provided fields are written (a rename can no longer clobber
+        a concurrent knowledge edit), and when ``expected_updated_at`` is
+        given the write is a compare-and-swap: ``ProjectUpdateConflictError`` is
+        raised if the row changed since the caller read it.
+        """
         project = await self._storage.get_project(project_id)
         if project is None:
             raise KeyError(f"Project not found: {project_id}")
         self._validate_project_fields(name, knowledge)
+        stripped_name: str | None = None
         if name is not None:
-            stripped = name.strip()
+            stripped_name = name.strip()
             siblings = await self._storage.list_projects()
             if any(
-                p.project_id != project_id and p.name.casefold() == stripped.casefold()
+                p.project_id != project_id and p.name.casefold() == stripped_name.casefold()
                 for p in siblings
             ):
-                raise ValueError(f"Project name already exists: {stripped}")
-            project.name = stripped
-        if knowledge is not None:
-            project.knowledge = knowledge
-        project.updated_at = _now_ms()
-        await self._storage.upsert_project(project)
-        row = project.model_dump(mode="json")
+                raise ValueError(f"Project name already exists: {stripped_name}")
+        try:
+            updated = await self._storage.update_project_fields(
+                project_id,
+                updated_at=_now_ms(),
+                name=stripped_name,
+                knowledge=knowledge,
+                expected_updated_at=expected_updated_at,
+            )
+        except aiosqlite.IntegrityError as exc:
+            raise ValueError(f"Project name already exists: {stripped_name}") from exc
+        if not updated:
+            if await self._storage.get_project(project_id) is None:
+                raise KeyError(f"Project not found: {project_id}")
+            raise ProjectUpdateConflictError(f"Project changed since it was read: {project_id}")
+        refreshed = await self._storage.get_project(project_id)
+        if refreshed is None:
+            raise KeyError(f"Project not found: {project_id}")
+        row = refreshed.model_dump(mode="json")
         row["session_count"] = await self._storage.count_sessions_in_project(project_id)
         return row
 

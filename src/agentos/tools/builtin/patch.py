@@ -123,18 +123,22 @@ def _parse_patch(patch_text: str) -> list[PatchOp]:
 
 
 def _parse_hunk_header(header: str) -> Hunk:
-    """Parse '@@@ -old_start,old_count +new_start,new_count @@@'."""
-    # Format: @@@ -10,3 +10,4 @@@
+    """Parse '@@@ -old_start[,old_count] +new_start[,new_count] @@@'."""
+    # Format: @@@ -10,3 +10,4 @@@ or @@@ -10 +10,4 @@@
     import re
 
-    m = re.match(r"@@@\s+-(\d+),(\d+)\s+\+(\d+),(\d+)\s+@@@", header.strip())
+    m = re.match(r"@@@\s+-(\d+)(?:,(\d+))?\s+\+(\d+)(?:,(\d+))?\s+@@@", header.strip())
     if not m:
         raise ValueError(f"Invalid hunk header: {header!r}")
+    old_start = int(m.group(1))
+    old_count = int(m.group(2)) if m.group(2) is not None else (0 if old_start == 0 else 1)
+    new_start = int(m.group(3))
+    new_count = int(m.group(4)) if m.group(4) is not None else (0 if new_start == 0 else 1)
     return Hunk(
-        old_start=int(m.group(1)),
-        old_count=int(m.group(2)),
-        new_start=int(m.group(3)),
-        new_count=int(m.group(4)),
+        old_start=old_start,
+        old_count=old_count,
+        new_start=new_start,
+        new_count=new_count,
     )
 
 
@@ -217,7 +221,7 @@ def _notify_bootstrap_source_writes(ops: list[PatchOp], root: Path) -> None:
 
 def _record_workspace_file_writes(ops: list[PatchOp], root: Path) -> None:
     for op in ops:
-        if isinstance(op, AddFile):
+        if isinstance(op, (AddFile, UpdateFile)):
             record_workspace_file_write(_validate_path(op.path, root))
 
 

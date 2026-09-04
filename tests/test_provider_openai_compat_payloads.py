@@ -392,12 +392,13 @@ def _collect_events(
     provider: OpenAIProvider,
     cfg: ChatConfig,
     tools: list[ToolDefinition] | None = None,
+    messages: list[Message] | None = None,
 ) -> list[Any]:
     async def _run() -> list[Any]:
         return [
             event
             async for event in provider.chat(
-                [Message(role="user", content="hi")],
+                messages or [Message(role="user", content="hi")],
                 config=cfg,
                 tools=tools,
             )
@@ -1637,3 +1638,212 @@ def test_stream_survives_a_null_function_object_inside_a_tool_call(monkeypatch: 
     assert [(event.tool_use_id, event.tool_name, event.arguments) for event in tool_ends] == [
         ("call_a", "lookup", {"q": "hi"}),
     ]
+
+
+def test_gemini_stream_tool_call_extracts_thought_signature(monkeypatch: Any) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        chunks = [
+            {
+                "model": "gemini-3.5-flash",
+                "choices": [
+                    {
+                        "delta": {
+                            "tool_calls": [
+                                {
+                                    "id": "call_list_dir",
+                                    "type": "function",
+                                    "function": {
+                                        "name": "default_api:list_dir",
+                                        "arguments": '{"DirectoryPath": "/tmp"}',
+                                    },
+                                    "thought_signature": "gemini_encrypted_signature_abc123",
+                                }
+                            ]
+                        },
+                        "finish_reason": None,
+                    }
+                ],
+            },
+            {
+                "model": "gemini-3.5-flash",
+                "choices": [{"delta": {}, "finish_reason": "tool_calls"}],
+                "usage": {"prompt_tokens": 10, "completion_tokens": 5},
+            },
+        ]
+        body = b"".join(f"data: {json.dumps(chunk)}\n\n".encode() for chunk in chunks)
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            content=body + b"data: [DONE]\n\n",
+        )
+
+    transport = httpx.MockTransport(handler)
+    real_async_client = httpx.AsyncClient
+
+    def patched_async_client(*args: Any, **kwargs: Any) -> httpx.AsyncClient:
+        kwargs["transport"] = transport
+        return real_async_client(*args, **kwargs)
+
+    monkeypatch.setattr("agentos.provider.openai.httpx.AsyncClient", patched_async_client)
+    provider = OpenAIProvider(
+        api_key="test",
+        model="gemini-3.5-flash",
+        base_url="https://generativelanguage.googleapis.com/v1beta/openai",
+        provider_kind="gemini",
+    )
+    tool = ToolDefinition(
+        name="default_api:list_dir",
+        description="List dir.",
+        input_schema=ToolInputSchema(
+            properties={"DirectoryPath": {"type": "string"}},
+            required=["DirectoryPath"],
+        ),
+    )
+
+    events = _collect_events(provider, ChatConfig(), tools=[tool])
+
+    tool_end = next(event for event in events if isinstance(event, ToolUseEndEvent))
+    assert tool_end.tool_use_id == "call_list_dir"
+    assert tool_end.tool_name == "default_api:list_dir"
+    assert tool_end.arguments == {"DirectoryPath": "/tmp"}
+    assert tool_end.thought_signature == "gemini_encrypted_signature_abc123"
+
+
+def test_gemini_build_messages_preserves_thought_signature() -> None:
+    from agentos.provider.openai import _build_openai_messages
+
+    msg = Message(
+        role="assistant",
+        content=[
+            ContentBlockToolUse(
+                id="call_list_dir",
+                name="default_api:list_dir",
+                input={"DirectoryPath": "/tmp"},
+                thought_signature="gemini_encrypted_signature_abc123",
+            )
+        ],
+    )
+
+    formatted = _build_openai_messages(msg, provider_kind="gemini")
+    assert len(formatted) == 1
+    assert formatted[0]["role"] == "assistant"
+    tool_calls = formatted[0]["tool_calls"]
+    assert len(tool_calls) == 1
+    assert tool_calls[0]["id"] == "call_list_dir"
+    assert tool_calls[0]["thought_signature"] == "gemini_encrypted_signature_abc123"
+
+
+def test_gemini_build_messages_synthetic_adds_skip_validator() -> None:
+    from agentos.provider.openai import _build_openai_messages
+
+    msg = Message(
+        role="assistant",
+        content=[
+            ContentBlockToolUse(
+                id="call_list_dir",
+                name="default_api:list_dir",
+                input={"DirectoryPath": "/tmp"},
+                thought_signature=None,
+            )
+        ],
+    )
+
+    formatted = _build_openai_messages(msg, provider_kind="gemini")
+    assert len(formatted) == 1
+    assert formatted[0]["role"] == "assistant"
+    tool_calls = formatted[0]["tool_calls"]
+    assert len(tool_calls) == 1
+    assert tool_calls[0]["id"] == "call_list_dir"
+    assert tool_calls[0]["thought_signature"] == "skip_thought_signature_validator"
+
+
+def test_gemini_outbound_chat_payload_includes_thought_signature(monkeypatch: Any) -> None:
+    captured: dict[str, Any] = {}
+    _patch_transport(monkeypatch, captured)
+
+    provider = OpenAIProvider(
+        api_key="test",
+        model="gemini-3.5-flash",
+        base_url="https://generativelanguage.googleapis.com/v1beta/openai",
+        provider_kind="gemini",
+    )
+
+    messages = [
+        Message(role="user", content="List the directory"),
+        Message(
+            role="assistant",
+            content=[
+                ContentBlockToolUse(
+                    id="call_list_dir",
+                    name="default_api:list_dir",
+                    input={"DirectoryPath": "/tmp"},
+                    thought_signature="sig_encrypted_999",
+                )
+            ],
+        ),
+        Message(
+            role="user",
+            content=[
+                ContentBlockToolResult(
+                    tool_use_id="call_list_dir",
+                    content='["file1.txt"]',
+                )
+            ],
+        ),
+    ]
+
+    _collect_events(provider, ChatConfig(), messages=messages)
+
+    outbound_messages = captured["payload"]["messages"]
+    assistant_msg = next(m for m in outbound_messages if m["role"] == "assistant")
+    assert assistant_msg["tool_calls"][0]["thought_signature"] == "sig_encrypted_999"
+
+
+def test_stream_consumer_stage_persists_thought_signature_and_history_rebuilds_it() -> None:
+    from agentos.engine.history import reconstruct_messages_from_entry
+    from agentos.engine.turn_runner.stream_consumer_stage import (
+        _StreamState,
+        _ToolResultHandler,
+        _ToolUseStartHandler,
+    )
+    from agentos.engine.types import ToolResultEvent, ToolUseStartEvent
+
+    state = _StreamState()
+    start_handler = _ToolUseStartHandler()
+    result_handler = _ToolResultHandler()
+
+    # 1. ToolUseStart arrives
+    start_handler.handle(
+        ToolUseStartEvent(
+            tool_use_id="call_test_123",
+            tool_name="test_tool",
+        ),
+        state,
+    )
+
+    # 2. ToolResult arrives carrying thought_signature
+    result_handler.handle(
+        ToolResultEvent(
+            tool_use_id="call_test_123",
+            tool_name="test_tool",
+            arguments={"query": "hello"},
+            result="success",
+            thought_signature="gemini_sig_transcript_persist",
+        ),
+        state,
+    )
+
+    # Verify tool_use segment in turn_segments has thought_signature
+    tool_use_seg = next(s for s in state.turn_segments if s.get("type") == "tool_use")
+    assert tool_use_seg["thought_signature"] == "gemini_sig_transcript_persist"
+
+    # Rebuild history from transcript segments
+    messages = reconstruct_messages_from_entry(
+        role="assistant",
+        content="",
+        tool_calls=state.turn_segments,
+    )
+    assert len(messages) >= 1
+    assistant_msg = messages[0]
+    tool_use_block = next(b for b in assistant_msg.content if b.type == "tool_use")
+    assert tool_use_block.thought_signature == "gemini_sig_transcript_persist"

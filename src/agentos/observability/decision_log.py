@@ -21,8 +21,12 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Literal
 
+import structlog
+
 from agentos.bootstrap_types import BootstrapFileReport
 from agentos.paths import default_agentos_home
+
+log = structlog.get_logger(__name__)
 
 SCHEMA_VERSION = 14
 _INTENT_SUMMARY_MAX_CHARS = 500
@@ -265,40 +269,68 @@ def load_entries(path: Path) -> list[DecisionEntry]:
     """Read a decisions JSONL file and return hydrated DecisionEntry records.
 
     Unknown fields are ignored so readers tolerate a future schema bump that
-    adds attributes (additive-only policy; see SCHEMA_VERSION).
+    adds attributes (additive-only policy; see SCHEMA_VERSION). Malformed or
+    partial lines are skipped so an interrupted write (SIGKILL mid-turn,
+    disk-full, etc.) does not poison every reader of that day's log.
     """
 
     if not path.is_file():
         return []
 
     entries: list[DecisionEntry] = []
-    for line in path.read_text(encoding="utf-8").splitlines():
-        line = line.strip()
+    skipped = 0
+    for line_no, raw_line in enumerate(
+        path.read_text(encoding="utf-8").splitlines(), start=1
+    ):
+        line = raw_line.strip()
         if not line:
             continue
-        payload = json.loads(line)
-        payload = _coerce_decision_payload(payload)
-        steps_payload = payload.pop("pipeline_steps", [])
-        steps = [
-            PipelineStepRecord(**_filter_payload(PipelineStepRecord, s))
-            for s in steps_payload
-            if isinstance(s, dict)
-        ]
-        bootstrap_payload = payload.pop("bootstrap_files", [])
-        bootstrap_files = [
-            BootstrapFileReport(**_filter_payload(BootstrapFileReport, item))
-            for item in bootstrap_payload
-            if isinstance(item, dict)
-        ]
-        savings_payload = payload.pop("savings", {})
-        savings = SavingsTelemetry(**_filter_payload(SavingsTelemetry, savings_payload))
-        entries.append(
-            DecisionEntry(
-                pipeline_steps=steps,
-                bootstrap_files=bootstrap_files,
-                savings=savings,
-                **_filter_payload(DecisionEntry, payload),
+        try:
+            payload = json.loads(line)
+            payload = _coerce_decision_payload(payload)
+            steps_payload = payload.pop("pipeline_steps", [])
+            steps = [
+                PipelineStepRecord(**_filter_payload(PipelineStepRecord, s))
+                for s in steps_payload
+                if isinstance(s, dict)
+            ]
+            bootstrap_payload = payload.pop("bootstrap_files", [])
+            bootstrap_files = [
+                BootstrapFileReport(**_filter_payload(BootstrapFileReport, item))
+                for item in bootstrap_payload
+                if isinstance(item, dict)
+            ]
+            savings_payload = payload.pop("savings", {})
+            savings = SavingsTelemetry(
+                **_filter_payload(SavingsTelemetry, savings_payload)
             )
+            entries.append(
+                DecisionEntry(
+                    pipeline_steps=steps,
+                    bootstrap_files=bootstrap_files,
+                    savings=savings,
+                    **_filter_payload(DecisionEntry, payload),
+                )
+            )
+        except (json.JSONDecodeError, ValueError, TypeError, AttributeError) as exc:
+            # A bad line (truncated write, wrong shape) must not crash every
+            # reader of this log. Mirror the tolerance of
+            # ``decision_log_aggregate.parse_log_line`` so the two readers
+            # of the same append-only file agree on what is fatal.
+            skipped += 1
+            log.debug(
+                "decision_log.skipped_malformed_line",
+                path=str(path),
+                line_no=line_no,
+                error=type(exc).__name__,
+                error_message=str(exc),
+            )
+    if skipped:
+        log.warning(
+            "decision_log.skipped_malformed_lines",
+            path=str(path),
+            skipped=skipped,
+            loaded=len(entries),
         )
     return entries
 

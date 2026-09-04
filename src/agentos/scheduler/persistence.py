@@ -815,10 +815,20 @@ class JobStore:
             return [_row_to_job(r) for r in rows]
 
     async def next_due_at(self) -> datetime | None:
-        """Return the earliest next_run_at among pending, enabled jobs."""
+        """Return the earliest time a pending, enabled job becomes runnable.
+
+        Must mirror ``iter_due``'s backoff gate: a job in error backoff is not
+        actually runnable until ``max(next_run_at, backoff_until)``. Computing
+        the wake time from ``next_run_at`` alone makes the timer loop wake early,
+        find nothing runnable (``iter_due`` excludes it while ``backoff_until``
+        is in the future), and busy-spin at the sleep floor for the whole
+        backoff window. Timestamps are stored as ISO-8601 text, which compares
+        correctly under SQLite MIN/MAX/COALESCE.
+        """
         async with self._db().execute(
             """
-            SELECT MIN(next_run_at) FROM scheduler_jobs
+            SELECT MIN(MAX(next_run_at, COALESCE(backoff_until, next_run_at)))
+            FROM scheduler_jobs
             WHERE status = ? AND enabled = 1 AND next_run_at IS NOT NULL
             """,
             (JobStatus.PENDING.value,),

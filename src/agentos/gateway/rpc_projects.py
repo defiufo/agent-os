@@ -17,6 +17,7 @@ import structlog
 
 from agentos.gateway.rpc import RpcContext, RpcHandlerError, RpcUnavailableError, get_dispatcher
 from agentos.session.keys import normalize_agent_id
+from agentos.session.manager import ProjectUpdateConflictError
 
 log = structlog.get_logger(__name__)
 
@@ -119,19 +120,33 @@ async def _handle_projects_update(params: dict | None, ctx: RpcContext) -> dict:
     project_id = _require_project_id(params)
     name = params.get("name")
     knowledge = params.get("knowledge")
+    expected = params.get("expectedUpdatedAt", params.get("expected_updated_at"))
     if name is None and knowledge is None:
         raise ValueError("params.name or params.knowledge is required")
     if name is not None and not isinstance(name, str):
         raise ValueError("params.name must be a string")
     if knowledge is not None and not isinstance(knowledge, str):
         raise ValueError("params.knowledge must be a string")
+    if expected is not None and not isinstance(expected, int):
+        raise ValueError("params.expectedUpdatedAt must be an integer timestamp")
 
     try:
-        project = await manager.update_project(project_id, name=name, knowledge=knowledge)
+        project = await manager.update_project(
+            project_id,
+            name=name,
+            knowledge=knowledge,
+            expected_updated_at=expected,
+        )
     except KeyError as exc:
         raise RpcHandlerError(
             "project.not_found",
             f"Project '{project_id}' does not exist",
+            details={"projectId": project_id},
+        ) from exc
+    except ProjectUpdateConflictError as exc:
+        raise RpcHandlerError(
+            "project.conflict",
+            f"Project '{project_id}' changed since it was read; reload and retry",
             details={"projectId": project_id},
         ) from exc
     await _broadcast_projects_changed("updated", project_id)

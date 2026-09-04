@@ -146,11 +146,30 @@ _EXFILTRATION_PATTERNS: Final[tuple[re.Pattern[str], ...]] = (
     ),
 )
 
+# Single source of truth for invisible codepoints that can be used to
+# bypass intent-phrase regexes. This set is shared between the
+# invisible_char threat class and the normalization pass so the two
+# lists cannot drift apart.
+#
+# Categories covered:
+#   U+00AD      SOFT HYPHEN
+#   U+200B-F    zero-width space / ZWNJ / ZWJ / BOM
+#   U+202A-E    bidi markers (LTR/RTL override, pop directional)
+#   U+2060-4    word joiner, function application, invisible operators
+#   U+2066-9    bidi isolates (first strong, pop directional)
+_INVISIBLE_CODEPOINTS_RE: Final[re.Pattern[str]] = re.compile(
+    "[\u00ad"
+    "\u200b-\u200f"
+    "\u202a-\u202e"
+    "\u2060-\u2064"
+    "\u2066-\u2069"
+    "\ufeff]"
+)
+
+# invisible_char threat class reuses the combined pattern so there is
+# exactly one codepoint list to maintain.
 _INVISIBLE_CHAR_PATTERNS: Final[tuple[re.Pattern[str], ...]] = (
-    # Zero-width space, ZWNJ, ZWJ, BOM
-    re.compile(r"[\u200b\u200c\u200d\ufeff]"),
-    # Bidi and right-to-left override (used to visually reorder payloads)
-    re.compile(r"[\u202a-\u202e\u2066-\u2069]"),
+    _INVISIBLE_CODEPOINTS_RE,
 )
 
 INJECTION_PATTERNS: Final[dict[str, tuple[re.Pattern[str], ...]]] = {
@@ -182,14 +201,28 @@ def classify_injection(text: str) -> list[str]:
     (subject to the usual caveat that regex defense is a blunt first
     line, not the only line — see :func:`wrap_untrusted` for the
     structural envelope).
+
+    Invisible characters (soft hyphens, word joiners, zero-width spaces,
+    bidi markers, etc.) that split intent phrases are normalized to a
+    space before matching *non*-invisible-character patterns, so
+    ``ignore\u00adall prior instructions`` is caught as
+    ``prompt_override``. The ``invisible_char`` class is matched against
+    the **original** text so the smuggling technique itself is reported.
     """
 
     if not text:
         return []
+
+    # Normalize invisible codepoints to space so they don't break
+    # word-boundary patterns. Use the same codepoint set as the
+    # invisible_char threat class — see _INVISIBLE_CODEPOINTS_RE.
+    normalized = _INVISIBLE_CODEPOINTS_RE.sub(" ", text)
+
     hits: set[str] = set()
     for threat_class, patterns in INJECTION_PATTERNS.items():
+        search_text = normalized if threat_class != "invisible_char" else text
         for pattern in patterns:
-            if pattern.search(text):
+            if pattern.search(search_text):
                 hits.add(threat_class)
                 break
     return sorted(hits)

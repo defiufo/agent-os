@@ -1111,7 +1111,8 @@ def create_skill_tools(loader: SkillLoader) -> None:
             f"Skill '{name}' created at {skill_file}. "
             "For output that should draw inline in Web chat instead of as a "
             "download chip, have the skill publish_artifact with an inline mime "
-            "(application/vnd.agentos.chart+json renders a candlestick chart); "
+            "(application/vnd.agentos.chart+json renders a candlestick chart, "
+            "application/vnd.agentos.cards+json a grid of record cards); "
             "docs/artifacts-and-media.md documents the payload."
         )
 

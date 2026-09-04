@@ -59,16 +59,12 @@ class TestProjectsCreate:
 
     @pytest.mark.asyncio
     async def test_create_requires_name(self, dispatcher, ctx):
-        res = await dispatcher.dispatch(
-            "r1", "projects.create", {"agentId": "main"}, ctx
-        )
+        res = await dispatcher.dispatch("r1", "projects.create", {"agentId": "main"}, ctx)
         assert res.ok is False
 
     @pytest.mark.asyncio
     async def test_create_requires_manager(self, dispatcher, ctx_no_manager):
-        res = await dispatcher.dispatch(
-            "r1", "projects.create", {"name": "X"}, ctx_no_manager
-        )
+        res = await dispatcher.dispatch("r1", "projects.create", {"name": "X"}, ctx_no_manager)
         assert res.ok is False
         assert res.error.code == "UNAVAILABLE"
 
@@ -102,6 +98,47 @@ class TestProjectsListGetUpdateDelete:
         )
         assert res.ok is True
         assert res.payload["project"]["knowledge"] == "v2"
+
+    @pytest.mark.asyncio
+    async def test_update_with_stale_expected_updated_at_conflicts(self, dispatcher, ctx):
+        project = await _create_project(dispatcher, ctx)
+        first = await dispatcher.dispatch(
+            "r1",
+            "projects.update",
+            {"projectId": project["project_id"], "knowledge": "v2"},
+            ctx,
+        )
+        assert first.ok is True
+        res = await dispatcher.dispatch(
+            "r2",
+            "projects.update",
+            {
+                "projectId": project["project_id"],
+                "knowledge": "v3",
+                "expectedUpdatedAt": project["updated_at"],
+            },
+            ctx,
+        )
+        assert res.ok is False
+        assert res.error.code == "project.conflict"
+        # The losing write must not have landed.
+        fresh = await dispatcher.dispatch(
+            "r3", "projects.get", {"projectId": project["project_id"]}, ctx
+        )
+        assert fresh.payload["project"]["knowledge"] == "v2"
+
+        winner = await dispatcher.dispatch(
+            "r4",
+            "projects.update",
+            {
+                "projectId": project["project_id"],
+                "knowledge": "v3",
+                "expectedUpdatedAt": first.payload["project"]["updated_at"],
+            },
+            ctx,
+        )
+        assert winner.ok is True
+        assert winner.payload["project"]["knowledge"] == "v3"
 
     @pytest.mark.asyncio
     async def test_delete_reports_detached_sessions(self, dispatcher, ctx, manager):
@@ -202,6 +239,4 @@ class TestSessionsProjectIntegration:
             "r2", "sessions.list", {"projectId": project["project_id"]}, ctx
         )
         assert res.ok is True
-        assert [row["key"] for row in res.payload["sessions"]] == [
-            "agent:main:webchat:11110005"
-        ]
+        assert [row["key"] for row in res.payload["sessions"]] == ["agent:main:webchat:11110005"]

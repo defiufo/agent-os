@@ -131,6 +131,7 @@ base_url = "https://openrouter.ai/api/v1"
 # openrouter       OPENROUTER_API_KEY        https://openrouter.ai/api/v1
 # bankr            BANKR_API_KEY             https://llm.bankr.bot/v1
 # opencap          OPENCAP_API_KEY           https://gw.capminal.ai/api/inference/v1
+# surplus          SURPLUS_API_KEY           https://api.surplusintelligence.ai/v1
 # openai           OPENAI_API_KEY            https://api.openai.com/v1
 # anthropic        ANTHROPIC_API_KEY         https://api.anthropic.com
 # ollama           none                      http://localhost:11434
@@ -165,11 +166,12 @@ base_url = "https://openrouter.ai/api/v1"
 # "z-ai/glm-5.2" = "z-ai"
 # "anthropic/claude-opus-5" = "anthropic"
 #
-# OpenCAP uses bare model IDs and sends values as a provider allow-list. Check
+# OpenCAP and Surplus use bare model IDs and send values as a provider/seller
+# allow-list. Check
 # its live model catalog for current model and upstream provider IDs. Omit this
 # table to keep gateway auto-routing.
 # [llm.provider_routing]
-# "glm-5.2" = "provider-id-from-live-catalog"
+# "glm-5.3" = "provider-id-from-live-catalog"
 
 # Prompt caching controls. Enables prefix caching for supported providers
 # (Anthropic, OpenAI, DeepSeek, OpenRouter, etc.).
@@ -599,8 +601,43 @@ cron_default_mode = "bypass"            # off | bypass | full
 # groups_enabled = false
 # group_chat_ids = ["-1001234567890"]
 # group_mention_required = true
+
+# [observability]
+# Prometheus metrics endpoint exposition, OTLP trace export, and log retention.
+# metrics_enabled = true                # Expose Prometheus metrics endpoint
+# metrics_path = "/metrics"             # HTTP route path for Prometheus exposition
+# otlp_enabled = false                  # Export traces to OpenTelemetry collector
+# otlp_endpoint = "http://localhost:4318" # OTLP/HTTP traces endpoint URL
+# otlp_headers = {}                     # Optional headers for OTLP exporter
+# otlp_service_name = "agentos"         # Service name reported in OTLP resource spans
+# log_retention_days = 14               # Prune log/trace files older than N days (0 = disabled)
+# log_retention_max_total_mb = 500      # Prune oldest logs when total dir size exceeds MB (0 = disabled)
+# log_retention_sweep_interval_s = 3600.0 # Cadence for background retention sweeps
+
 # transcribe_voice = false
 # max_voice_duration_s = 120
+
+# [[channels.channels]]
+# name = "inbox"
+# type = "email"
+# imap_host = "imap.example.com"
+# imap_port = 993
+# imap_username = "agent@example.com"
+# imap_password = "app-password"
+# imap_folder = "INBOX"
+# smtp_host = "smtp.example.com"
+# smtp_port = 587
+# smtp_starttls = true          # set smtp_ssl = true with port 465 for implicit TLS
+# smtp_username = "agent@example.com"
+# smtp_password = "app-password"
+# from_address = "agent@example.com"
+# from_name = "Agent"
+# Required fail-closed From-address allowlist: exact addresses or *@domain
+# patterns. Mail from anyone else is dropped before it reaches the agent.
+# allowed_senders = ["you@example.com", "*@yourteam.example"]
+# poll_interval_s = 30.0
+# max_messages_per_poll = 10
+# mark_seen = true
 
 # MCP (Model Context Protocol) external servers.
 # [[mcp.servers]]

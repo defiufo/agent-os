@@ -619,6 +619,58 @@ def test_done_handler_uses_provider_from_exact_routed_tier(
     assert extra == []
 
 
+def test_done_handler_prices_the_model_that_actually_ran(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Routing not applied → price the turn from the model the provider billed.
+
+    Regression: the routed model was priced even when it never ran (observe
+    rollout, or an explicit model that beat the route), inventing a cost and a
+    saving for a model nobody called.
+    """
+    lookups: list[tuple[str, str]] = []
+
+    def lookup_price(model_id: str, provider_id: str = "") -> PriceEntry:
+        lookups.append((model_id, provider_id))
+        prices = {
+            ("minimax-m3", "bankr"): PriceEntry(0.08, 0.32),
+            ("claude-opus-4.8", "opencap"): PriceEntry(2.0, 8.0),
+        }
+        return prices.get((model_id, provider_id), PriceEntry(0.0, 0.0))
+
+    monkeypatch.setattr(runtime_module, "lookup_price", lookup_price)
+    tiers = {
+        "c0": {"provider": "bankr", "model": "minimax-m3"},
+        "c3": {"provider": "opencap", "model": "claude-opus-4.8"},
+    }
+    state = _make_state()
+    inp = _make_input(
+        state=state,
+        turn=_make_turn(
+            metadata={
+                "routed_tier": "c0",
+                "routed_model": "minimax-m3",
+                "routing_applied": False,
+                "routing_override_source": "explicit_model",
+            }
+        ),
+        router_cfg=SimpleNamespace(tiers=tiers, estimated_output_savings_pct=0.03),
+    )
+
+    transformed, extra = _DoneHandler().handle(
+        DoneEvent(text="result", input_tokens=1_000_000, model="claude-opus-4.8"),
+        inp,
+        state,
+    )
+
+    # Priced as opus (what ran), not as the c0 tier the router only advised:
+    # same model as the savings baseline, so there is nothing to claim.
+    assert transformed.total_savings_usd == pytest.approx(0.0)
+    assert transformed.total_savings_pct == pytest.approx(0.0)
+    assert lookups[-1] == ("claude-opus-4.8", "opencap")
+    assert extra == []
+
+
 @pytest.mark.asyncio
 async def test_compaction_handler_runs_persist_snapshot_prompt_in_order() -> None:
     persist = _RecordingCompactionPersist()

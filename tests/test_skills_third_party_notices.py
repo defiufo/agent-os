@@ -27,6 +27,7 @@ ORIGINALS = {
     "poolsdotfun-token-launcher",
     "pptx",
     "robinhood-agentic-trading",
+    "robinhood-chain-stocks",
     "robinhood-rwa-addresses",
     "senior-unilp-manager",
     "stack-trace-generic-probe",

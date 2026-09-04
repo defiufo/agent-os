@@ -429,6 +429,68 @@ async def test_case09_model_override_at_call_site() -> None:
 
 
 @pytest.mark.asyncio
+async def test_explicit_model_demotes_the_route_it_overrode() -> None:
+    """An explicit model beats the route, so the route must stop claiming it ran.
+
+    Regression: the metadata kept ``routing_applied=True`` and the routed
+    model, so the HUD event, the DoneEvent and per-turn usage all reported a
+    model the provider was never asked for — and credited savings for it.
+    """
+    turn = _make_turn(
+        metadata={
+            "routed_tier": "c0",
+            "routed_model": "minimax-m3",
+            "applied_model": "minimax-m3",
+            "baseline_model": "claude-opus-4.8",
+            "routing_applied": True,
+            "savings_pct": 87.5,
+            "savings_max_price_per_m": 2.0,
+            "savings_routed_price_per_m": 0.08,
+        },
+        model="minimax-m3",
+    )
+    executor = _RecordingPipelineExecutor(turn=turn, provider=_StubProvider("pp"))
+    stage = _make_stage(executor=executor)
+
+    out = await stage.run(_make_input(model="claude-opus-4.8"))
+
+    assert out.output.resolved_model == "claude-opus-4.8"
+    metadata = out.output.turn.metadata
+    assert metadata["routing_applied"] is False
+    assert metadata["routing_override_source"] == "explicit_model"
+    assert metadata["applied_model"] == "claude-opus-4.8"
+    assert metadata["baseline_model"] == "claude-opus-4.8"
+    assert metadata["savings_pct"] == 0.0
+    # The router's advice survives — flagged as advice by routing_applied.
+    assert metadata["routed_tier"] == "c0"
+    assert metadata["routed_model"] == "minimax-m3"
+
+
+@pytest.mark.asyncio
+async def test_route_that_ran_keeps_its_metadata_intact() -> None:
+    turn = _make_turn(
+        metadata={
+            "routed_tier": "c0",
+            "routed_model": "minimax-m3",
+            "applied_model": "minimax-m3",
+            "routing_applied": True,
+            "savings_pct": 87.5,
+        },
+        model="minimax-m3",
+    )
+    executor = _RecordingPipelineExecutor(turn=turn, provider=_StubProvider("pp"))
+    stage = _make_stage(executor=executor)
+
+    out = await stage.run(_make_input(model=None))
+
+    assert out.output.resolved_model == "minimax-m3"
+    metadata = out.output.turn.metadata
+    assert metadata["routing_applied"] is True
+    assert "routing_override_source" not in metadata
+    assert metadata["savings_pct"] == 87.5
+
+
+@pytest.mark.asyncio
 async def test_case10_no_session_manager() -> None:
     session_id = _RecordingSessionIdResolver(session_id=None)
     stage = _make_stage(session_id=session_id)

@@ -26,7 +26,7 @@ from agentos.provider.types import ContentBlockDocument, ContentBlockImage
 
 _BLOCK_FIELDS: dict[str, set[str]] = {
     "text": {"type", "text"},
-    "tool_use": {"type", "id", "name", "input"},
+    "tool_use": {"type", "id", "name", "input", "thought_signature", "thoughtSignature"},
     "tool_result": {"type", "tool_use_id", "content", "is_error", "execution_status"},
     "image": {"type", "source_type", "media_type", "data"},
     "document": {"type", "source_type", "media_type", "data", "title"},
@@ -254,7 +254,12 @@ def _project_historical_tool_use(
         changed = True
 
     return (
-        ContentBlockToolUse(id=block.id, name=block.name, input=projected_input),
+        ContentBlockToolUse(
+            id=block.id,
+            name=block.name,
+            input=projected_input,
+            thought_signature=block.thought_signature,
+        ),
         changed,
     )
 

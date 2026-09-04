@@ -12,6 +12,7 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse
 from starlette.routing import Route
 
+from agentos.gateway.auth import token_matches
 from agentos.gateway.config import GatewayConfig
 from agentos.gateway.uploads import (
     _MULTIPART_FRAMING_ALLOWANCE,
@@ -94,7 +95,9 @@ def register_audio_transcription_routes(
 
     async def transcribe_handler(request: Request) -> JSONResponse:
         if config.auth.mode == "token":
-            if config.auth.token and _extract_authorization_token(request) != config.auth.token:
+            if config.auth.token and not token_matches(
+                _extract_authorization_token(request), config.auth.token
+            ):
                 return JSONResponse(
                     {
                         "error": (

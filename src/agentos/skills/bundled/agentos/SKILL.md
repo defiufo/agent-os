@@ -133,20 +133,20 @@ Top-level: `init`, `onboard`, `configure`, `doctor`, `upgrade`, `chat`,
 | `projects` | `list`, `create` (`--knowledge`/`--knowledge-file`), `show`, `update`, `delete`, `move <session> <project\|none>` — group sessions across agents; the knowledge text is injected into every member session's prompt |
 | `cron` | `list`, `status`, `add` (also takes `--session-key`, the chat a job reports into), `update` (both take `--job-kind`, `--script`, `--script-arg`, `--workdir`, `--elevated`, `--elevated-mode`, `--tool-policy`; the policy's `profile` must be one of `coding`/`full`/`memory_only`/`messaging`/`minimal`, or be omitted), `remove`, `run`, `runs` |
 | `channels` | `list`, `status`, `types`, `describe`, `native-commands`, `add`, `remove`, `enable`, `disable`, `edit`, `restart`, `logout`, `pairing …` |
-| `memory` | `status`, `index`, `list`, `search`, `show`, `embedding-download`, `raw-fallbacks …` |
+| `memory` | `status`, `index`, `list`, `search`, `show`, `ingest`, `curated`, `embedding-download`, `raw-fallbacks …` |
 | `sandbox` | `status`, `on`, `bypass`, `full`, `reset` |
 | `search` | `list`, `status`, `query`, `configure` |
 | `auth` | `login xai` (`--no-wait`/`--resume`/`--json` for non-blocking use), `status`, `logout xai` — xAI OAuth (SuperGrok / X Premium+) for `x_search`; tokens in `~/.agentos/auth.json`, never printed |
 | `configure x-search` | xAI X (Twitter) search: `--api-key-env`, `--x-search-model`, `--x-search-reasoning-effort`, `--no-x-search-enabled`; catalog via `onboard catalog x-search` |
-| `cost` | usage and estimated cost report |
+| `cost` | usage and estimated cost report; `savings` for the Pilot Router savings report (`--pdf`) |
 | `diagnostics` | `status`, `on`, `off` |
 | `migrate` | `openclaw`, `hermes` (`--source`, `--profile`, `--apply`, `--migrate-secrets`; dry-run without `--apply`) |
 | `agents` | `list`, `add`, `delete` (durable agents) |
 | `mcp-server` | `run` (MCP bridge) |
 | `replay`, `dist`, `onboard` | replay recorded turns / workspace inventory / setup status |
 
-Built-in channel types are `discord`, `slack`, and `telegram`; use `agentos
-channels types` as the authoritative catalog. Config migration backs up the
+Built-in channel types are `discord`, `email`, `slack`, and `telegram`; use
+`agentos channels types` as the authoritative catalog. Config migration backs up the
 file before removing entries for retired built-in channel types.
 
 Telegram direct messages always require pairing. Use `agentos channels pairing
@@ -154,6 +154,11 @@ list <name>`, `approve <name> <code>`, `deny <name> <sender-id>`, or `revoke
 <name> <sender-id>`. Pairing is binary and has no admin/owner tier. Telegram
 groups are disabled by default; enable them only with explicit
 `group_chat_ids`, paired senders, and the desired mention requirement.
+
+The `email` channel is IMAP polling in, SMTP out, and needs no platform app
+registration. `allowed_senders` is a required fail-closed From-address
+allowlist (exact addresses or `*@domain` patterns); one mail thread is one
+session.
 
 Platform-native interactive tool approvals (Slack block actions, Telegram inline keyboard callbacks, and Discord message components) allow operators to approve or deny gated tool executions directly using interactive buttons. For security, these approvals are restricted to channel DMs (never group chats), access-gated by evaluating the clicker's sender ID against the channel's access policy, and strictly session-bound to their originating chat context.
 
@@ -176,8 +181,10 @@ binaries read. `agentos env list` shows every variable AgentOS knows about,
 whether it is set, and which skill or provider needs it — values are masked
 unless you ask for `agentos env get <NAME> --reveal`. Names that steer
 subprocess execution (`PATH`, `LD_PRELOAD`, `EDITOR`, …) or runtime posture
-(`AGENTOS_AGENT_PERMISSIONS`, `AGENTOS_GATEWAY_TOKEN`, …) cannot be written
-through AgentOS; edit the file by hand if one is genuinely needed. When
+(`AGENTOS_AGENT_PERMISSIONS`, `AGENTOS_GATEWAY_TOKEN`, …) or outbound routing
+(`HTTP_PROXY`, `AGENTOS_LLM_PROXY`, `AGENTOS_TRUST_ENV`, … — proxy names in any
+casing) cannot be written through AgentOS; edit
+the file by hand if one is genuinely needed. When
 `agentos env list` reports a variable's source as `process env`, the shell
 that started the gateway exported it and that value wins over the file.
 
@@ -214,6 +221,7 @@ Main `agentos.toml` sections (full commented reference:
 | `[channels]` | messaging channels (`[[channels.channels]]` entries) |
 | `[auxiliary]` | model for work AgentOS runs itself, not the agent's turn (document analysis, image description): `provider`, `model`, `timeout_seconds`, `[auxiliary.tasks.<task>]`. Empty = reuse `[llm]` |
 | `[prompt]` | prompt-layer flags: `platform_hint_enabled`, `env_probe_enabled` (local-toolchain block, names only) |
+| `[observability]` | Prometheus metrics (`metrics_enabled`, `metrics_path`), OTLP trace export (`otlp_enabled`, `otlp_endpoint`, `otlp_headers`, `otlp_service_name`), log retention (`log_retention_days`, `log_retention_max_total_mb`, `log_retention_sweep_interval_s`) |
 | `[prompt_cache]` | Prompt-cache continuity: `mode` = `auto` (default) \| `on` \| `off`. Env override: `AGENTOS_CACHE_MODE` (legacy `prompt_cache.enabled` / `AGENTOS_CACHE_ENABLED` deprecated) |
 | `[safety]` | Prompt-ingress safety: `wrap_untrusted_workspace` (default true), `injection_scan_mode` (`report` default, `enforce` redacts matched workspace-file content, `off`) |
 | `[budgets]` | money spend ceilings (USD): `session_limit`/`session_warn`, `daily_limit`/`daily_warn` (per UTC day, persisted across restarts), and per-key `[budgets.agent_daily_limit]` / `[budgets.channel_daily_limit]` (plus `*_warn`). A turn at or above a hard limit is refused with `budget_exceeded`; a warn threshold raises a one-shot `budget_warning`. Nothing is enforced until a ceiling is set |
@@ -513,6 +521,11 @@ agentos cost                   # usage + estimated spend
 # agentos cost --agent-id <agent-id> --channel-type <channel-type>
 # agentos cost --tool-name <tool-name> --skill <skill-name>
 # agentos cost --export /path/to/export.csv
+agentos cost savings           # what the Pilot Router saved, from the local decision log
+# agentos cost savings [--json] [--csv] [--start-date …] [--end-date …] [--log-dir …]
+# agentos cost savings --pdf /path/to/report.pdf   # branded, shareable PDF
+# Baseline = the priciest model in [router.tiers], input tokens only, routing
+# mechanism only. Reads ~/.agentos/logs/decisions-*.jsonl; no gateway needed.
 agentos diagnostics on         # runtime diagnostics logging
 agentos migrate hermes --source <dir> [--apply]   # dry-run first, then --apply
 ```

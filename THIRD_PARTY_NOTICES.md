@@ -155,7 +155,9 @@ SOFTWARE.
 ## GMGN-derived bundled skill descriptors
 
 - Component: SKILL.md instruction text for these bundled skills, plus
-  `gmgn-holder-analysis/scripts/analyze.py`:
+  `gmgn-holder-analysis/scripts/analyze.py`,
+  `gmgn-wallet-analysis/scripts/analyze.py`, and
+  `gmgn-wallet-score/scripts/score.py`:
   - `gmgn-cooking`
   - `gmgn-holder-analysis`
   - `gmgn-market`
@@ -163,16 +165,24 @@ SOFTWARE.
   - `gmgn-swap`
   - `gmgn-token`
   - `gmgn-track`
+  - `gmgn-wallet-analysis`
+  - `gmgn-wallet-score`
 - Upstream project: https://github.com/GMGNAI/gmgn-skills
 - License: MIT
 - Copyright notice: Copyright (c) 2025 GMGN
 
 These descriptors drive the third-party `gmgn-cli` npm package, which AgentOS
 does **not** redistribute — an operator installs it themselves and supplies
-their own `GMGN_API_KEY`. Only the descriptor text and the holder-analysis
-helper script are vendored here; AgentOS added the `provenance` and
-`metadata.agentos` frontmatter blocks and re-pointed the helper-script path at
-`{baseDir}`. Per the MIT license, the upstream copyright and permission notice
+their own `GMGN_API_KEY`. Only the descriptor text and the helper scripts are
+vendored here; AgentOS added the `provenance` and `metadata.agentos` frontmatter
+blocks, re-pointed the helper-script paths at `{baseDir}`, folded the
+`gmgn-wallet-score` description into a YAML block scalar so its frontmatter
+parses, and lifted that skill's upstream inline analyzer into
+`scripts/score.py` (argv in place of the `<FILL_IN_*>` placeholders), matching
+what was already done for `gmgn-holder-analysis`. The two wallet skills'
+`description` fields were also shortened to the length of their bundled
+siblings; upstream's run roughly twice as long and did not fit the shipped
+skills-prompt budget. Per the MIT license, the upstream copyright and permission notice
 are reproduced below in their entirety and apply to the GMGN-derived bundled
 files.
 
@@ -222,6 +232,7 @@ are released under AgentOS's repository license (Apache-2.0; see `LICENSE`):
 - `poolsdotfun-token-launcher`
 - `pptx`
 - `robinhood-agentic-trading`
+- `robinhood-chain-stocks`
 - `robinhood-rwa-addresses`
 - `senior-unilp-manager`
 - `stack-trace-generic-probe`

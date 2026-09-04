@@ -226,3 +226,39 @@ def test_azure_default_construction_is_outside_a_stage_support() -> None:
         _build_provider(
             ProviderConfig(provider="azure", model="deployment-name", api_key="test-key")
         )
+
+
+@pytest.mark.parametrize(
+    ("provider_kind", "expected_display_name"),
+    [
+        ("openai", "OpenAI"),
+        ("openrouter", "OpenRouter"),
+        ("opencap", "OpenCAP"),
+        ("deepseek", "DeepSeek"),
+        ("moonshot", "Moonshot"),
+        ("dashscope", "DashScope"),
+        ("gemini", "Gemini"),
+        ("zhipu", "Zhipu"),
+        ("qianfan", "Qianfan"),
+        ("volcengine", "Volcengine"),
+        ("azure", "Azure OpenAI"),
+        ("bailian_coding", "Bailian Coding"),
+        ("mistral", "Mistral"),
+        ("groq", "Groq"),
+        ("siliconflow", "SiliconFlow"),
+        ("aihubmix", "AIHubMix"),
+        ("minimax", "MiniMax"),
+        ("minimax_openai", "MiniMax"),
+        ("byteplus", "BytePlus"),
+        ("bankr", "Bankr"),
+        ("vllm", "vLLM"),
+        ("lm_studio", "LM Studio"),
+        ("ovms", "OVMS"),
+        ("unknown_provider", "Provider"),
+    ],
+)
+def test_provider_display_name_mapping(provider_kind: str, expected_display_name: str) -> None:
+    from agentos.provider.openai import _provider_display_name
+
+    assert _provider_display_name(provider_kind) == expected_display_name
+

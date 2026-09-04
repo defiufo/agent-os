@@ -4,6 +4,922 @@ All notable changes to AgentOS will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [Unreleased]
+
+## [2026.9.4] - 2026-09-04
+
+### Fixed
+
+- `agentos config set skills.config.<skill>.<key>` persists again. `_set_key`
+  only overwrote keys already present in `to_toml_dict()`, and an empty
+  `skills.config` is omitted there for rollback compatibility, so the documented
+  command could never create the map. Missing intermediate dicts are now created
+  under `skills.config` only, and unknown keys outside that map stay rejected.
+  The no-`--config` path stopped lying too: it printed a fabricated
+  `AGENTOS_GATEWAY_` export and exited 0 for keys that do not bind — including
+  `gateway.port` and every `skills.config.*` key — so a user followed the hint
+  and set an environment variable that nothing reads. Keys are validated against
+  the model first, and the free-form `skills.config` map, which has no env
+  binding, is refused outright
+  ([#834](https://github.com/use-agent-os/agent-os/issues/834)).
+- `load_entries` skips malformed lines in the decisions JSONL instead of raising
+  on the first one. The file is append-only and written once per turn, so a
+  SIGKILL mid-turn, an OOM or a disk-full error can leave a truncated line
+  behind — and `load_entries` is the shared reader for cost-savings reports,
+  session export and pipeline replay, all of which died together. The realistic
+  corruption is not a bad string but a wrong-shape payload, which surfaces as
+  `ValueError`/`TypeError` out of `_filter_payload` rather than
+  `JSONDecodeError`, so all of them are caught. Skips are accounted for: one
+  debug event per line with path, line number and error class, and one warning
+  with the totals at the end, so a partial report announces itself instead of
+  quietly under-reporting. This matches the tolerance
+  `decision_log_aggregate.parse_log_line` already had, so the two readers of the
+  same file now agree on what is fatal
+  ([#812](https://github.com/use-agent-os/agent-os/issues/812)).
+- An MCP client disconnecting no longer takes another client's tool with it.
+  When two servers registered the same tool name, disconnect unregistered the
+  name unconditionally, so the surviving client's tool vanished from the
+  registry. Each active client's exact registry spec and handler are tracked; a
+  colliding tool is unregistered only when the disconnecting client owns the
+  active handler, and otherwise the most recently registered handler from a
+  still-active client is restored
+  ([#801](https://github.com/use-agent-os/agent-os/issues/801)).
+- `background_process` output is capped at 1,000,000 retained characters per
+  session, evicting older chunks so the most recent tail survives. Draining
+  continues past the cap, so a noisy subprocess cannot block on a full pipe, and
+  the retained character count and truncation state are exposed in the process
+  session and log payloads
+  ([#803](https://github.com/use-agent-os/agent-os/issues/803)).
+- Provider credit exhaustion is classified as `INSUFFICIENT_CREDITS` rather than
+  a transient fault. OpenAI returns `insufficient_quota` with HTTP 429, which
+  read as `RATE_LIMITED` and tripped the circuit breaker for a billing fault no
+  cooldown can heal; Anthropic returns `billing_error` with HTTP 402, which read
+  as `UNKNOWN` and carried no recovery hint. A cross-provider
+  `_is_insufficient_credits()` check runs before the status-code branch, so the
+  raw code and message win over the ambiguous 429
+  ([#777](https://github.com/use-agent-os/agent-os/issues/777)).
+- CLI JSON output survives a non-UTF-8 terminal encoding.
+  `json.dumps(..., ensure_ascii=False)` emits raw non-ASCII, and on a Windows
+  code page (cp1252, cp437) `sys.stdout.write` raised `UnicodeEncodeError`.
+  `_write_json_text` writes UTF-8 bytes to the underlying binary buffer when one
+  exists — lossless, so the JSON contract holds for pipes and files — and falls
+  back to the text layer with `errors="backslashreplace"`, which keeps the data
+  as round-trippable `\uXXXX` escapes instead of destroying an em dash into `?`
+  ([#764](https://github.com/use-agent-os/agent-os/issues/764)).
+- Memory-write refresh callbacks reach the running turn.
+  `build_turn_runner_from_services` never populated `svc._turn_runner_ref`, so
+  `_on_memory_write` had nothing to call and `refresh_memory_snapshot(agent_id)`
+  never ran on the active `TurnRunner`
+  ([#761](https://github.com/use-agent-os/agent-os/issues/761)).
+- `apply_patch` records `UpdateFile` in `ctx.workspace_file_writes`. Only
+  `AddFile` was recorded, so a patch that edited an existing file left the
+  engine's auto-publish path with nothing to publish, even though `UpdateFile`
+  is a peer of `AddFile` everywhere else in the module. The parser also accepts
+  the optional line counts in a standard `@@ -a,b +c,d @@` hunk header
+  ([#753](https://github.com/use-agent-os/agent-os/issues/753)).
+- `parse_version()` understands a bare `.dev` suffix and sorts dev
+  pre-releases per PEP 440. There was a fallback defaulting a bare `.post` to
+  `0` but none for `.dev`, so `2026.7.18.dev` parsed with `dev = None`, fell
+  through to the final-release phase and compared equal to `2026.7.18` —
+  suppressing the `is_newer()` update notice for every development install
+  ([#740](https://github.com/use-agent-os/agent-os/issues/740)).
+- Email is marked seen after the message is converted, not before, so a failure
+  mid-conversion leaves the message unread and eligible for the next poll
+  ([#719](https://github.com/use-agent-os/agent-os/issues/719)).
+- `robinhood-chain-stocks` handles a non-dict RPC error payload. `_eth_call`
+  assumed `error` was a mapping and crashed when a node returned a plain string
+  ([#815](https://github.com/use-agent-os/agent-os/issues/815)).
+- `gmgn-wallet-score` prints usage instead of crashing. `score.py` indexed
+  `sys.argv[1]` and `sys.argv[2]` unguarded, so running it with too few
+  arguments raised an unhandled `IndexError`; it now validates argument count,
+  exits 2 with usage on stderr, and answers `-h`/`--help` with exit 0
+  ([#819](https://github.com/use-agent-os/agent-os/issues/819)).
+- Frontend line endings are normalised so Prettier stops failing on Windows
+  checkouts. `.gitattributes` marks frontend sources `text=auto` — not a blanket
+  `eol=lf`, which would have flagged PNG, webp and woff2 assets as text and
+  corrupted them — and Prettier is configured with `endOfLine: "auto"`
+  ([#825](https://github.com/use-agent-os/agent-os/issues/825)).
+
+### Security
+
+- Invisible Unicode characters are normalised before intent-phrase matching. A
+  soft hyphen, word joiner, zero-width space or bidi isolator placed between two
+  words split the intent-phrase regexes, so a prompt-injection payload evaded
+  the guard entirely in both report and enforce mode. `classify_injection` now
+  normalises invisible codepoints to a space before matching the non-invisible
+  patterns, while `invisible_char` is still matched against the original text so
+  the smuggling technique itself is reported rather than erased
+  ([#690](https://github.com/use-agent-os/agent-os/issues/690)).
+- Search results carry their provider origin, so text returned by a search
+  backend is attributable when the injection guard inspects it
+  ([#688](https://github.com/use-agent-os/agent-os/issues/688)).
+- Per-IP rate limiting covers the Control UI API subtree.
+  `RateLimitMiddleware._is_ui_path()` exempted the entire Control UI prefix,
+  including everything mounted under `{base_path}/api/*`, so
+  `/control/api/sessions`, `/control/api/chat` and `/control/api/config` took
+  unlimited unauthenticated requests. It now mirrors the check
+  `AuthMiddleware._is_ui_path()` already had
+  ([#748](https://github.com/use-agent-os/agent-os/issues/748)).
+- `send_file` checks file size before reading. Every channel adapter opened or
+  read the file first, so a large attachment meant memory exhaustion — the
+  email adapter base64-expands the whole payload in memory — or a long upload
+  that ended in an API rejection. `check_channel_file_size` stats the file up
+  front against each service's real ceiling (Discord 10 MB, Telegram 50 MB,
+  email 25 MB) and raises with the limit named
+  ([#683](https://github.com/use-agent-os/agent-os/issues/683)).
+- `robinhood-chain-stocks` rejects a non-`http(s)` `--rpc-url`. The URL reached
+  the HTTP layer unvalidated, so a `file://` URL turned an RPC call into a local
+  file read; empty URLs and a bare `http://` are refused as well
+  ([#816](https://github.com/use-agent-os/agent-os/issues/816)).
+
+## [2026.9.3] - 2026-09-03
+
+### Added
+
+- **Inline card grids in Web chat** — a second AgentOS-native artifact mime,
+  `application/vnd.agentos.cards+json`, alongside the existing chart one. A
+  skill publishes a JSON payload and the transcript renders a responsive grid of
+  record cards, each with an optional logo, a colour-coded status badge, and
+  per-field copy buttons — instead of a download chip.
+
+  This is the shape a markdown table handles badly: a 42-character contract
+  address forces the table into a horizontal scroll, while a card gives the
+  address its own line next to a copy button. `badgeTone` accepts
+  `positive`/`warning`/`danger`/`neutral` and falls back to `neutral` for
+  anything else, so a skill can introduce a new status without waiting on a
+  frontend release. At most 24 cards render and the remainder are counted and
+  reported under the grid rather than dropped silently.
+
+  Every payload string reaches the DOM through `textContent`, never
+  `innerHTML`, and `logo` is restricted to `http(s)` URLs — card fields carry
+  on-chain metadata, which is attacker-controlled on a permissionless chain.
+
+  `robinhood-rwa-addresses` is the first consumer: `scripts/rwa_cards.py` reads
+  the lookup's JSON on stdin and emits the artifact, so an address answer in the
+  Web UI arrives as a grid with the verification badge attached to each result.
+  `docs/artifacts-and-media.md` documents the payload.
+
+- **Skills publish their own artifacts.** `exec_command` now honours a
+  `publish_artifact path=<file> mime=application/vnd.agentos.<x>+json` marker on
+  a command's own output, so a skill that writes a chart or card payload gets it
+  rendered without the model deciding to publish it. Live-testing the card
+  renderer produced the same outcome seven times across two models: the script
+  ran, the payload was written, and the answer came back as a hand-written
+  markdown table with the artifact stranded in the workspace — a render that
+  only happens when the model feels like it is not a contract.
+
+  Only the `application/vnd.agentos.` family auto-publishes, so ordinary command
+  output cannot push a workspace file at the user; a plain file still needs a
+  deliberate `publish_artifact` call. The marker must own its line, so prose
+  mentioning it is inert; at most four publish per command, with the overflow
+  reported rather than dropped; and `publish_artifact`'s workspace containment
+  is unchanged. The whole path is best-effort — a shell command never fails, and
+  never loses its output, because a publish did not work out. This also fixes
+  the existing `gmgn-token` and `gmgn-market` chart artifacts, which had the
+  same failure mode. Both Robinhood skills now write their card payload on every
+  run (`<SYMBOL>.cards.json`, marker on stderr so stdout stays pure JSON,
+  `--no-cards` to opt out), and `robinhood-chain-stocks` gains
+  `scripts/chain_cards.py`.
+
+- Cards identify their subject with a locally drawn ticker monogram. The card
+  grid has a logo slot, but the console's CSP is
+  `img-src 'self' data: https://raw.githubusercontent.com`, so a token-list CDN
+  image is blocked outright and the card was quietly dropping the broken `img`
+  and showing nothing. Widening the CSP would also tell that CDN which tickers a
+  user is researching, from their IP — a real leak on a finance surface, for
+  decoration. The monogram needs no request and no trademarked artwork; the
+  `logo` img is still attached and still takes over, but only on a real `load`,
+  so an `error` now leaves the monogram standing instead of an empty slot.
+
+### Fixed
+
+- Telegram Bot API calls now retry `ConnectTimeout` and `PoolTimeout` alongside
+  `ConnectError`. All three happen before any request bytes reach Telegram — a
+  DNS/TLS handshake that never completed, or a wait for a pooled connection —
+  but the two timeouts are `TimeoutException` siblings of `ConnectError` rather
+  than subclasses, so `TelegramChannel._api()` dropped them into its generic
+  `RequestError` branch and raised on the very first attempt with zero retries.
+  `ReadTimeout` stays out of the retry path on purpose: by then the request is
+  in flight, and re-sending a `getUpdates` long poll would double-poll it.
+  ([#651](https://github.com/use-agent-os/agent-os/issues/651))
+- **`robinhood-rwa-addresses` now verifies every address against Robinhood
+  Chain instead of trusting the token index.** The skill decided what counted
+  as a genuine Stock Token from a name suffix in CoinGecko's list, which was
+  wrong in both directions. CoinGecko caps `name` at 60 characters, so long
+  listings lost the "• Robinhood Token" marker mid-word and were dropped
+  entirely — `--query IBM` returned no matches at all, as did VTI, XLK, CTSH
+  and CRDO. In the other direction, 47 of the 238 entries the skill reported as
+  verified Stock Tokens (JPM, MCD, DIS, UBER, ABNB, PYPL and others) have **no
+  contract deployed at the advertised address**; the skill handed them out as
+  usable addresses, and funds sent to one would be unrecoverable.
+
+  Discovery still ranks candidates from the token list, but the answer is now
+  settled on chain: every genuine Stock Token is a proxy pointing at Robinhood's
+  shared EIP-1967 beacon `0xe10b6f6b275de231345c20d14ab812db62151b00`, which a
+  permissionless impersonator cannot forge. One batched JSON-RPC round-trip
+  (`https://rpc.mainnet.chain.robinhood.com`, no key, ~0.5s) classifies each
+  match as `verified`, `not-deployed`, `not-a-stock-token`, or `unverified`,
+  and a top-level `warning` carries the caveat. Undeployed listings are still
+  returned — silently dropping them reads as "the skill is broken" — but are
+  flagged and never presented as usable addresses.
+
+  Following `robinhood-chain-stocks`, an unreachable node yields `unverified`
+  rather than a negative verdict: a network fault is never reported as evidence
+  that a token is fake. `--no-verify` skips the check explicitly and says so in
+  its own wording, and `--rpc-url` points at an alternate node. The name-suffix
+  match is retained only as the offline fallback, now tolerant of truncation.
+
+- TaskRuntime queue depth gauge (`agentos_queue_depth`) now decrements when
+  tasks leave the pending queue, instead of staying stuck at the peak enqueue
+  value (#668).
+- The sensitive-path hard block now refuses destructive intents that target
+  the filesystem root. `rm -rf /` carries no sensitive *prefix*, so the
+  denylist never matched it and a whole-host wipe fell through to the ordinary
+  approval flow — which `/elevated bypass` skips outright. Every spelling that
+  resolves to or sweeps the top level is covered: `/`, `//`, `/.`, `/..`,
+  `/*`, `/*/*`, `/**`, `/?*`, `/.*` and `/[a-z]*`. Globs that name a subset
+  (`/tmp*`) are untouched, and root counts as sensitive only in the
+  delete-intent scan — reading or listing `/` stays ordinary work (#563).
+- The image tool now reports a redirect that carries no `Location` header
+  instead of the confusing failure it caused downstream. `_fetch_image_url`
+  follows redirects itself so every hop is re-validated against the SSRF guard;
+  a 3xx with no `Location` closed the response and fell out of the loop, so the
+  failure surfaced as httpx's generic `Failed to fetch image from URL: Redirect
+  response '302 Found' for url ...` (or a `StreamClosed` from reading the body
+  that had just been closed, depending on the httpx version) rather than the
+  dead-end hop that actually broke. It now raises `Redirect response from <url>
+  missing Location header`, naming the URL that returned it.
+- Channel HTTP retries now cover every transient timeout, survive an
+  HTTP-date `Retry-After`, and hand back an exhausted rate limit.
+  `retry_request` caught `(ConnectError, ReadTimeout)`, but `ConnectTimeout`,
+  `WriteTimeout` and `PoolTimeout` descend from `TimeoutException` — a sibling
+  of `ConnectError` under `TransportError` — so a DNS, TLS-handshake, upload or
+  connection-pool timeout on any Slack/Discord/Telegram/webhook call escaped
+  the backoff and crashed the caller on the first stall; the clause is now
+  `(ConnectError, TimeoutException)`. `Retry-After` was parsed with a bare
+  `float()`, so the HTTP-date form RFC 7231 §7.1.3 permits turned a rate limit
+  into a `ValueError` inside the retry loop: the header is now resolved as
+  delay-seconds or HTTP-date, falls back to the computed backoff when it is
+  unparseable, non-finite, negative or already past, and is clamped to 300s so
+  a provider cannot park a send for hours. The 429 branch also gained the
+  `attempt < max_retries` guard the 5xx branch already had, so an exhausted
+  rate limit returns the response — status, headers and provider error body
+  intact — instead of sleeping once more and raising a bare
+  `RuntimeError("retry_request exhausted")` (#642, #599).
+- The email channel can poll an IMAP folder whose name contains spaces.
+  `imap_folder` was handed to `imaplib` verbatim, and `imaplib` does not quote
+  mailbox arguments, so a folder such as `Sent Items` — ordinary on
+  Exchange/Outlook — went on the wire as two tokens and every poll failed with
+  an opaque `BAD [CLIENTBUG] Invalid syntax`. The name is now emitted as an
+  RFC 3501 quoted-string, escaping `\` and `"`, and a name carrying a control
+  character (a CR or LF would have ended the command line and run its tail as a
+  second IMAP command) is refused at channel start instead of at poll time.
+- `SubscriptionManager._message_subs` now removes empty sets on
+  unsubscription and connection teardown, preventing a slow memory leak
+  on long-running gateways (#609).
+- An email reply no longer drops the thread root when the inbound message
+  carries no `References` header. `_merge_references` read only `References`,
+  so for the second message of a thread — where most mail clients send
+  `In-Reply-To` alone — the parent id was discarded and the outgoing reply
+  referenced only itself, breaking the conversation apart in Gmail, Outlook and
+  Thunderbird. The chain now falls back to `In-Reply-To` when `References` is
+  absent, per RFC 5322 3.6.4. Both threading headers are now read by one
+  parser that drops comments and accepts ids with or without angle brackets,
+  and `thread_key_for` shares it, so the thread cache key and the reference
+  chain can no longer disagree about which message is the root (#620).
+- The Environment view's path strip shortens Windows paths again. `shortPath`
+  split on `/` only, so a gateway-reported `C:\Users\<name>\.agentos\.env` counted
+  as a single segment and was rendered untrimmed, overflowing the header strip
+  it was written to keep short. Backslashes are normalised before splitting, so
+  Windows and mixed-separator paths trim to their last two segments like POSIX
+  ones do.
+- Provider content-moderation blocks are classified as `POLICY_REFUSAL` again
+  instead of falling through to `BAD_REQUEST`/`UNKNOWN`. `_is_policy_refusal()`
+  held only generic phrasing, so the wording providers actually emit went
+  unmatched: Azure OpenAI's canonical *"triggering Azure OpenAI's content
+  management policy"* does not contain the adjacent words "content policy", the
+  OpenAI/Azure `content_filter` code and `finish_reason` matched nothing, and
+  Gemini's "blocked by safety" is not "safety policy". Since a refusal and a
+  malformed request map to different recovery actions, the misclassification
+  sent real policy blocks down the wrong path. Added `content_filter`,
+  `content filter`, `responsible_ai_policy`, `content management policy` and
+  `blocked by safety` (#629).
+
+- Cron schedules that restrict both day-of-month and day-of-week now follow the
+  POSIX OR rule instead of ANDing the two fields. `0 0 1,15 * 5` means "the 1st,
+  the 15th, or any Friday" — as it does in cron, croniter, and every scheduler
+  users compare against — where AgentOS previously required a date to be both a
+  1st/15th *and* a Friday, silently killing such schedules for virtually the
+  whole month. `CronField` now records whether the field was written as a bare
+  `*`, since expanding `*` to the full value set made it indistinguishable from
+  an explicit `1-31`/`0-6` at match time and the rule applies only when neither
+  day field is a wildcard. Schedules with a wildcard in either day field are
+  unchanged. This also restores parity with the cron panel in the web UI, whose
+  "next runs" preview (`frontend/src/views/cron/logic.ts`) has always applied
+  the OR rule — so the times it showed disagreed with when the job actually
+  fired. ([#660](https://github.com/use-agent-os/agent-os/issues/660))
+- `MemorySyncManager` retries a file whose indexing failed instead of losing it
+  until the next edit. `_do_file_sync()` replaced `_mtimes` with the fresh scan
+  *before* the index loop ran, so by the time `store.index_file()` raised, the
+  failing path was already recorded as seen — the next watcher tick compared
+  equal, the path never entered `changes`, and the retry its docstring promised
+  never happened. A transient store error (SQLite lock, provider timeout) on
+  `MEMORY.md` therefore left searches running against a stale or missing index
+  for that file until it was modified again or the process restarted. Index
+  failures now come back from `_do_file_sync()` alongside the existing delete
+  failures and are re-enqueued into `_pending_changes`, keeping the manager
+  dirty until a retry succeeds. The initial `start()` pass re-enqueues too,
+  where `_mtimes` is empty and the watcher diff could never have recovered the
+  path (#638).
+
+- `OtlpTraceSink.flush()` is serialized by the `_flush_lock` it always
+  declared but never acquired. Concurrent flushes — a `write()` batch trigger
+  racing the periodic flush task — could post to the OTLP collector
+  simultaneously, delivering spans out of order and, when a post failed,
+  re-queueing the same events twice so they were duplicated in the queue. The
+  lock is now held across the drain-post-requeue cycle, with an empty-queue
+  fast path before it so the uncontended case stays allocation-free
+  ([#672](https://github.com/use-agent-os/agent-os/issues/672)).
+- `agentos sessions export` derives its default filename through
+  `_safe_archive_part` instead of only replacing `:`. A session id is
+  gateway-supplied text, and every character outside `[A-Za-z0-9_.-]` — a `/`
+  or a `..` segment among them — reached `Path()` untouched, so the export
+  could be written outside the directory the command was run in. The shared
+  helper also now strips leading and trailing dots, so an id that sanitizes to
+  `..` can no longer name the parent directory
+  ([#678](https://github.com/use-agent-os/agent-os/issues/678)).
+- HTTP chat errors name the provider that actually failed.
+  `_provider_display_name` mapped only a handful of kinds, so Azure, Bailian,
+  Mistral, Groq, SiliconFlow, AIHubMix, MiniMax, BytePlus, Bankr, vLLM,
+  LM Studio and OVMS all surfaced as a generic "Provider" in the message the
+  user reads.
+
+### Security
+
+- The strict SSRF fetch guard now enforces the cloud-metadata floor directly
+  instead of inferring it from the private/link-local ranges. `ssrf.py` keeps a
+  shared `_METADATA_ADDRESSES` set described as the non-negotiable floor, but
+  only the permissive guard (`assert_not_metadata_endpoint`, used by
+  `http_request`) consulted it. The stricter `assert_address_allowed_for_fetch`
+  — used by `web_fetch`, the media image fetch, browser navigation and
+  skill-dependency downloads — derived its coverage from `is_private` /
+  `is_loopback` / `is_link_local` / `is_reserved` instead.
+
+  That left the two guards inverted for one address. Alibaba Cloud's
+  `100.100.100.200` sits in CGNAT space (`100.64.0.0/10`), which Python
+  classifies as none of those and which no hard-blocked network covers, so the
+  *strict* guard allowed it while the *permissive* one blocked it. On an
+  Alibaba ECS deployment a URL the agent could be steered to fetch — directly,
+  or by prompt injection from page content it reads — returned the instance RAM
+  role credentials into the transcript. The connect-time guard shares the same
+  predicate, so DNS-delivered and redirect-hop variants were equally unguarded.
+
+  The metadata hostname check (`metadata.google.internal` and friends) now runs
+  in `validate_http_url_for_fetch` too, so a resolver answering those names
+  cannot launder the request through a public-looking address. Fetch policy is
+  a strict superset of the metadata-only policy again, and a parametrized test
+  asserts that for every entry in the shared set — the invariant that was
+  missing, rather than the single address that happened to break it.
+
+- The MCP SSE and Streamable HTTP transports now connect through the same
+  SSRF guard as the built-in HTTP tools. Both built a bare `httpx.AsyncClient`
+  from `MCPServerConfig.url` with no validation at all, so an MCP server entry
+  pointed at `169.254.169.254` reached the cloud metadata endpoint and its
+  instance credentials.
+
+  The policy is `validate_metadata_only_address` — the floor `http_request`
+  takes — not the full `validate_http_url_for_fetch`: `http://localhost:PORT/mcp`
+  and LAN-hosted MCP servers are the normal, intended configuration, and the
+  stricter policy rejects loopback and private ranges. The guard is installed as
+  a connect-time network backend (`ssrf_guarded_client`) rather than run once
+  against the URL text, so the address that gets validated is the address that
+  gets dialed: checking the URL and then handing it to a plain client leaves
+  httpx to resolve the hostname a second time, which a short-TTL DNS-rebinding
+  name can answer differently. Non-`http(s)` server URLs are now rejected up
+  front. ([#662](https://github.com/use-agent-os/agent-os/issues/662))
+
+- Slack webhooks are rejected when no signing secret is configured, instead of
+  being ingested. `_handle_webhook` logged a warning and carried on:
+  `event_callback` payloads were ingested and slash commands were enqueued, so
+  any unauthenticated POST to the Events API endpoint could inject messages and
+  commands into a session — only interactive form payloads were turned away.
+  The handler now fails closed. Without a signing secret it still answers the
+  `url_verification` handshake — that only echoes a challenge and has no side
+  effects, so an operator can pass Slack's endpoint check while wiring the
+  secret up — and returns 401 for everything else
+  ([#674](https://github.com/use-agent-os/agent-os/issues/674)).
+- Slack request signatures are verified against the raw request bytes. The
+  base string was assembled as text (`f"v0:{timestamp}:{body.decode()}"`) and
+  re-encoded, so any body whose bytes do not survive a UTF-8 decode/encode
+  round-trip — and any body that fails to decode at all, which raises inside
+  the verifier — was checked against a different byte sequence than the one
+  Slack signed. The HMAC is now computed over `b"v0:" + timestamp + b":" +
+  body` with the body never decoded
+  ([#680](https://github.com/use-agent-os/agent-os/issues/680)).
+
+## [2026.9.2] - 2026-09-02
+
+### Added
+
+- **Surplus Intelligence** (`surplus`) as a runtime provider — a two-sided
+  marketplace that routes each request to the cheapest healthy seller. It is
+  configured like any other OpenAI-compatible provider with a buyer API key
+  (`SURPLUS_API_KEY`, `inf_…`) against
+  `https://api.surplusintelligence.ai/v1`; the x402/USDC and MPP per-request
+  payment protocols it also offers are deliberately not wired up, so nothing
+  crypto-related enters the dependency tree.
+
+  Its model catalog is public and unauthenticated, and follows OpenRouter's
+  shape rather than the flatter gateway one — rates are USD *per token*, and an
+  extra `supported_features` array names `vision`/`reasoning`/`tools` directly.
+  Because marketplace prices move with seller competition, cost estimates come
+  from that live catalog instead of a static table: the boot fetch doubles as
+  the price seed and refreshes on its own TTL, with a bounded negative cache
+  when it is unreachable. `AGENTOS_SURPLUS_LIVE_PRICING=0` pins estimates to
+  the static table.
+
+  Ships a `surplus` router tier profile (`deepseek-v4-flash`, `gpt-5.6-luna`,
+  `glm-5.3`, `claude-opus-5`, image `glm-5.3-flash`). Without one the router
+  would silently fall back to the OpenRouter tier table, whose namespaced ids
+  (`openai/gpt-5.6-luna`) this marketplace does not serve. The image tier is
+  `glm-5.3-flash` rather than OpenCAP's `minimax-m3`: Surplus publishes
+  `minimax-m3` without vision.
+
+- Two GMGN wallet skills the earlier vendoring pass left behind:
+  `gmgn-wallet-analysis` (a copy-trade dossier on one wallet — four pass/fail
+  gates, what it holds and buys now, its copy window in seconds, and a size cap)
+  and `gmgn-wallet-score` (track record, copy-tradeability with a
+  latency/slippage/gas backtest, and developer reputation for wallets that
+  mostly launch tokens). Both answer "should I follow this trader", which the
+  bundled set could previously only support with raw `gmgn-portfolio` fields.
+  Upstream's `gmgn-wallet-score` frontmatter is not valid YAML — an unquoted
+  `: ` inside `description` — so its description is folded into a block scalar
+  here; without that the loader drops the skill silently.
+- New bundled skill `robinhood-chain-stocks`: reads tokenized-stock state
+  directly from Robinhood Chain (chainId 4663) over JSON-RPC — Chainlink USD
+  price, the ERC-8056 `uiMultiplier()` corporate-action ratio, `oraclePaused()`,
+  total supply, and wallet balances with their USD value. Read-only by
+  construction: it issues only `eth_call` and never signs, sends, or holds a
+  key. Feed addresses are resolved from Chainlink's reference-data directory
+  rather than hardcoded, resolved from the ticker the contract reports so an
+  address-only lookup still finds its price. Prices carry `ageSeconds` and a
+  `stale` flag (past the feed's heartbeat, or oracle paused) so a market-closed
+  quote is not read as the current price, and a non-positive feed answer is
+  reported as unusable instead of `$0`. Authenticity is reported three ways —
+  verified, disproven by a revert, or unverified because the node was
+  unreachable — so a network fault is never presented as proof that a genuine
+  listing is fake.
+
+- `agentos cost savings` reports what the Pilot Router actually saved. Every
+  turn already wrote `SavingsTelemetry` to `~/.agentos/logs/decisions-*.jsonl`
+  and nothing read it back; the existing reports covered routing quality and
+  feature-extraction latency, not dollars. The command rolls that telemetry up
+  into a summary and a per-route breakdown with `--json`, `--csv`,
+  `--start-date` / `--end-date`, `--log-dir`, and `--pdf` for a branded
+  one-page report. It reads the decision log directly, so it works with the
+  gateway stopped.
+
+  The figure is a floor, and the report says so on the page. Despite its name,
+  `routing_savings_usd_estimated_vs_baseline` is not measured against the
+  sibling `baseline_model` field: it is the input-price delta between the
+  routed model and the most expensive model configured in `[router.tiers]`,
+  times input tokens, clamped at zero. So the column is labelled `Requested`,
+  the comparison is named as the top tier, and only input tokens are priced —
+  tool-result projection, short-reply enforcement, prompt-cache hits and
+  thinking mode are all excluded so the number stays attributable to the
+  router (#788).
+
+### Changed
+
+- The default skills-prompt budget (`skills.max_skills_prompt_chars`) rises from
+  24,000 to 26,000 characters. The shipped skill set's own descriptions had grown
+  past the old ceiling, which would have dropped full-mode installs to a
+  narrower render; the budget is a cap, so installs that were already under it
+  send no more than before. Configs that set the value themselves are untouched.
+- OpenCAP's router tier defaults track OpenCAP's own catalog again. `c2` moves
+  from `glm-5.2` to `glm-5.3` (1.31M context, published by the gateway since the
+  last update), and the profile is declared in its own table instead of being
+  cloned from the Bankr profile with the provider string swapped — the two
+  gateways publish overlapping but different catalogs, so cloning made OpenCAP
+  silently inherit Bankr's release cadence. `c0` (`deepseek-v4-flash`), `c1`
+  (`gpt-5.6-luna`), `c3` (`claude-opus-5`) and the image route (`minimax-m3`)
+  are unchanged; each is still the newest of its family the gateway serves.
+- Five models OpenCAP now publishes are declared in the model registry:
+  `glm-5.3`, `glm-5.3-flash`, `grok-4.6`, `kimi-k3` and `muse-spark-1.2`. They
+  carry published context windows, output caps and vendor rack rates, so an
+  offline estimate for them no longer falls through to the generic $3/$15
+  default. OpenCAP's live catalog remains canonical for its own pricing.
+- The Ollama "model not found" branch of `classify_provider_error` now spells
+  out its grouping as `"model not found" in text or ("pull" in text and "model"
+  in text)`. The behaviour is unchanged — `and` already bound tighter than `or`
+  — but the intent no longer rests on implicit precedence, and the branch is
+  now covered by tests (#582).
+
+### Fixed
+
+- The email channel no longer honours an off-allowlist `Reply-To`. The From
+  address was checked against the fail-closed `allowed_senders` list, but the
+  `Reply-To` header — equally attacker-controlled on an admitted message — was
+  taken verbatim as the reply target, so an allowlisted sender could redirect
+  the agent's answer, tool output included, to any mailbox. `Reply-To` is now
+  run through the same allowlist and falls back to the From address when it is
+  off-list, rather than the whole message being rejected. The reply target is
+  re-checked when the outbound reply is built, so a stale or tampered thread
+  cache cannot reintroduce an off-list recipient.
+- A `thinking_level` set on an OpenCAP GLM tier is no longer silently dropped.
+  The gateway capability gate reported `supports_reasoning=False` for every
+  model except DeepSeek V4, so the `c2` default's declared `thinking_level`
+  never reached the wire even though GLM 5.x reasons by default and streams
+  `reasoning_content`. GLM ids on OpenCAP now resolve Z.ai's
+  `{"thinking": {"type": ...}}` switch, verified live in both positions. Scoped
+  to OpenCAP; the Bankr gateway is a separate deployment and keeps its previous
+  behavior.
+- The offline vision fallback recognizes `gpt-5.6-*`, `glm-5.3-flash` and
+  `muse-spark-*` as image-capable. Previously, if the catalog fetch failed, the
+  `c1` default was reported as text-only and image turns had nowhere to route.
+- `upsert_llm_provider` now validates an operator-supplied provider `base_url`
+  before it is persisted or handed to the httpx client. The RPC
+  (`onboarding.provider.configure`) and `agentos providers configure` accepted
+  any string, so a caller could point every completion request — carrying the
+  provider `Authorization` header — at a cloud metadata service, an internal
+  host, or an attacker's server, or hand a `file://` URL to httpx. The value
+  must now be an absolute http(s) URL and may not be a cloud metadata endpoint
+  or a private / link-local / reserved IP — including the `inet_aton` spellings
+  (`http://2852039166/`) that reach the metadata service without looking like
+  an address. Loopback stays allowed for local model servers, and a `base_url`
+  that is already persisted (a saved profile, a provider default, or the value
+  the onboarding import path replays) is not re-validated (#551).
+
+- `robinhood-rwa-addresses` no longer answers a company question with a
+  community token that impersonates it. Robinhood Chain is permissionless and
+  the public token list carries both kinds: two entries are named "GameStop"
+  with symbol `GME`, and the lookup stripped the `• Robinhood Token` suffix —
+  the only thing telling them apart — before ranking, so which address came
+  back was down to list order. Asking for `NET` returned the "NetNet" community
+  token above Cloudflare. The lookup now matches Stock Tokens only (opt back in
+  with `--include-community`, where real listings still rank first), tags every
+  match with `isStockToken`, and reports a `stock_tokens` count. The skill doc's
+  hardcoded "~228 tokens" claim, stale against the 658-entry list, is gone
+  (#745).
+- Email channel outbound sends no longer fail for every agent-initiated
+  message. `EmailChannel._resolve_target` read only `metadata["to"]` and the
+  in-memory inbound-thread table, so the built-in `message` tool (which writes
+  the target as `metadata["recipient"]`) and scheduler / heartbeat delivery
+  (which pass the bare address as `reply_to`) both raised
+  `ValueError: email.send has no recipient for reply_to`. Recipients now
+  resolve in order: `metadata["to"]`, `metadata["recipient"]`, the thread
+  cache, then `reply_to` when it parses as an address; a fresh outbound mail
+  with no thread also gets a real subject instead of `Re: (no subject)` (#598).
+- **Security (SSRF, DNS rebinding):** the SSRF guard validated a URL by
+  resolving its hostname once, but httpx resolved that hostname *again* when it
+  opened the connection — so a short-TTL (rebinding) domain could answer with a
+  public address for the guard and with `169.254.169.254` for the socket,
+  handing an agent the cloud metadata endpoint and the instance credentials it
+  serves. `agentos.tools.ssrf_client` adds a validating httpcore network backend
+  that resolves and checks the destination itself at connect time and then
+  connects to a validated IP literal, so the address that was checked is the
+  address that is used; TLS is unchanged (SNI and certificate verification still
+  run against the origin hostname). `web_fetch`, the media image fetch,
+  `http_request` and `x_search` (metadata-endpoint floor only, so localhost and
+  LAN targets keep working) and skill-dependency downloads all fetch through it
+  (#516).
+- Gemini context-overflow errors classify as `CONTEXT_OVERFLOW` again. Gemini
+  reports overflow as `the input token count (X) exceeds the maximum number of
+  tokens allowed (Y)`, which no marker matched, so it fell through to the
+  `status_code == 400` branch and surfaced as `BAD_REQUEST` — the turn died
+  instead of taking the `COMPACT_AND_RETRY` path (#657).
+- Anthropic context-overflow errors do the same. `prompt_too_long`,
+  `exceed context limit`, `request_too_large` and `request size exceeds` join
+  the marker list, so an overflowed Anthropic turn compacts and retries rather
+  than surfacing a bad-request error to the user (#613).
+- The `@sandboxed` decorator derives a valid argv for `git_diff`. The
+  `argv_factory` produced a command line the sandbox could not run, so the
+  tool failed under sandboxing rather than being inspected and allowed (#614).
+- `web_fetch` decodes the body with the charset the server advertised
+  (`Content-Type`'s `charset` parameter) instead of a hard-coded UTF-8 decode,
+  so ISO-8859-1, Shift_JIS and GBK pages no longer reach the model as runs of
+  U+FFFD. The encoding is snapshotted inside the client block before any body
+  read, matching what `http_request` already does.
+- `MemorySyncManager` passes the filesystem mtime its watcher already captured
+  to `LongTermMemoryStore.index_file()`, for both watched memory files and
+  knowledge-base documents. Persisted freshness and retrieval recency now
+  track the source file rather than the moment the sync ran, matching the
+  direct ingestion path — and without an extra stat (#649).
+- The scheduler cancels its startup catch-up tasks on shutdown. They were
+  fired and never retained, so a shutdown mid-catch-up left them running
+  against a closing runtime instead of being cancelled and awaited with the
+  regular timer tasks (#655).
+
+### Security
+
+- `GET /api/approvals` is no longer exempt from per-IP rate limiting. The
+  endpoint serializes every pending exec/plugin approval — command, argv and
+  params — and takes a SQLite read on each call, so the carve-out let any
+  caller that clears the auth gate poll it at unlimited rate: continuous
+  observation of pending tool-call arguments, and enough SQLite read pressure
+  to stall the approval/chat pipeline. On the default `auth.mode="none"`
+  (loopback-confined) that is any local process; under token auth it is any
+  token holder. `HEAD` is covered too — Starlette serves it from the same
+  route, so it runs the same handler.
+
+  It is now counted in a dedicated per-IP bucket rather than the shared
+  `/api/*` one, because the Web UI polls it every 1.5s (~40 req/min per open
+  tab) and the shared default of 100/min would have 429'd operators out of
+  their own approval queue. The cap is `AGENTOS_RATE_APPROVALS_MAX_REQUESTS`,
+  default 300 per window. Being per-IP, it bounds a single source; it is not a
+  defence against a distributed one (#569).
+- Proxy names are no longer writable through any AgentOS surface. `set_env_var`
+  (and the Web UI, `agentos env set`, and the gateway RPC) could previously
+  write `AGENTOS_LLM_PROXY`, which `gateway/llm_runtime.py`, `provider/openai.py`
+  and `provider/auxiliary.py` apply to every provider client — letting an agent,
+  or a prompt injection reaching one, route all model traffic through a proxy of
+  its choosing and read the `Authorization` header off it. `AGENTOS_LLM_PROXY`,
+  `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY` and `NO_PROXY` now join
+  `env_policy.WRITE_DENYLIST`, matched in **any casing** — the proxy readers
+  (`urllib.request.getproxies_environment()`, which httpx goes through)
+  lower-case every name they find, so denying only the two conventional
+  spellings would leave `Http_Proxy` as an equivalent way in. `AGENTOS_TRUST_ENV`,
+  which decides whether the ambient `*_PROXY` names are honoured at all, is
+  denied with the other posture names. Values exported in the shell or
+  hand-written into `~/.agentos/.env` keep working; only writing through
+  AgentOS is refused (#550).
+- **Trusted-proxy auth validates the transport peer, not a header substring.**
+  `auth.mode = "trusted-proxy"` admitted any request whose client-supplied
+  `X-Forwarded-For` merely *contained* the configured proxy string — the real
+  peer was never checked, so any network peer could send
+  `X-Forwarded-For: <proxy>` and get full Control RPC access. The gate now
+  requires `request.client.host` to be in the trusted-proxy set; once that
+  passes, `XFF` is honoured downstream for client identity, which is what the
+  mode exists for (nginx / Caddy / ALB all set it). The trust check is a single
+  shared `peer_is_trusted_proxy` helper used by `AuthMiddleware`,
+  `RateLimitMiddleware` and the RPC `resolve_auth` layer — which previously had
+  no trusted-proxy branch at all — so the two gates cannot drift (#568).
+- **Cron webhooks cannot reach cloud metadata endpoints.**
+  `validate_webhook_url` checked only scheme and hostname, so a cron job could
+  POST its run output — model output and tool results — to AWS IMDS, the GCP or
+  Azure metadata service, or anything else in the link-local range, and the
+  response would come back as the delivery result. The shared metadata floor
+  `http_request` already uses is now applied on create, on update, and at
+  delivery time. Localhost hooks keep working (#574).
+- **`web_fetch` downloads are capped at a hard byte limit.** The whole response
+  body was buffered into memory before `max_chars` was applied — `max_chars`
+  truncates what the model sees, not what is downloaded — so one chunked
+  response with no (or a lying) `content-length` could exhaust process memory
+  and take the agent or gateway down; the 30s timeout bounds time, not bytes.
+  The response is now streamed and reading stops at
+  `AGENTOS_WEB_FETCH_DOWNLOAD_LIMIT` (default 1 MiB), with `truncated=True`
+  when the cap is hit. The response is closed only after the redirect
+  `Location` header is read, so a 3xx with no `Location` no longer fails
+  against a closed stream (#502).
+- **The exec approval cache parses every `rm` in a compound command.** It used
+  `re.search`, which stops at the first match, so `rm A; rm -rf /` had its
+  second invocation skipped entirely — the destructive target never reached the
+  intent scan. Every `rm` is now tokenized independently with `re.finditer`,
+  with capture stopping at shell separators. Regression tests pin both layers:
+  every separator ends an `rm` invocation, and a sensitive *read* in a later
+  segment is still refused at the tool boundary by `exec_command`'s
+  whole-command scan (#512, #676).
+
+## [2026.9.1] - 2026-09-01
+
+### Added
+
+- Observability for long-running gateways: a Prometheus `GET /metrics` endpoint
+  backed by thread-safe multi-dimensional `Counter` / `Gauge` / `Histogram`
+  types wired to `TaskRuntime`, an `OtlpTraceSink` that exports `TraceEvent`
+  records to any OpenTelemetry collector over HTTP/JSON (`/v1/traces`), and a
+  log-retention sweeper that prunes `~/.agentos/logs/**` by TTL age and by a
+  maximum total disk budget so a gateway left running for months no longer
+  fills the disk (#367).
+
+### Changed
+
+- Project knowledge is now capped at 24,000 characters on write — the same
+  ceiling the per-turn injection applies — instead of 32,000. Text between the
+  two caps used to save fine, echo back intact from the API, and then be
+  silently truncated out of every turn with only the model able to see the
+  marker. Rows already above the new cap keep working (validated on the next
+  write, truncated at injection until then), and the Web UI knowledge editor
+  now shows a character counter for the real limit.
+
+### Security
+
+- The `projects_*` agent tools are now scoped to the calling session.
+  `projects_list` used to hand the model every project's knowledge text and
+  `projects_update` accepted any `project_id`, so one prompt-injected
+  instruction in any member session could read all knowledge and overwrite
+  another project's — text that then runs inside the system prompt of every
+  member session of that project, every turn. `projects_move_session` likewise
+  accepted arbitrary session keys, allowing the same hand-off by moving a
+  victim session into a poisoned project. Now `projects_update` edits only the
+  calling session's own project, `projects_list` includes knowledge only for
+  that project, and `projects_move_session` moves only the calling session;
+  cross-project management stays on the Web UI / CLI / RPC surface, which is
+  control-plane only.
+- Gateway token authentication now compares secrets in constant time. The four
+  token gates (`resolve_auth` for WebSocket/RPC, the HTTP `AuthMiddleware`, the
+  upload route and the audio-transcription route) used `==`/`!=`, which
+  short-circuits on the first differing byte and leaks the token byte by byte
+  under timing analysis. All four route through a shared `token_matches` helper
+  built on `hmac.compare_digest` that fails closed on a missing or empty
+  configured token; the auth contract is otherwise unchanged (#498).
+- The sensitive-payload egress guard now inspects URL userinfo. It scanned path
+  segments and query values only, but httpx turns `https://user:sk-…@host/` into
+  an `Authorization: Basic` header on the wire, so a vendor-shaped credential
+  parked in userinfo egressed unchecked through `http_request`, `web_fetch`
+  (on every redirect hop) and the media `image` tool. Username and password are
+  now percent-decoded and matched, raising a `sensitive_url_userinfo` marker
+  (#499).
+- `http_request` now caps what it downloads, not just what it returns. The
+  request was issued non-streaming, so httpx buffered the whole body into
+  memory before the 1 MB model-facing limit was applied — a chunked response
+  with no (or a lying) `content-length` read fully into RAM, letting one
+  attacker-influenced URL exhaust process memory. The response is now streamed
+  and accumulation stops at a hard byte ceiling, reporting `download_capped`
+  (#508).
+- Scheduler `timeout_seconds` is bounded on both cron create and update.
+  It was accepted unvalidated: `<= 0` makes `asyncio.wait_for` run the handler
+  with no wait at all, and a huge value holds a model turn open for years — a
+  scheduler denial of service from a single `add`/`update` call. Values below
+  1 second or above 24 hours are now rejected (#570).
+
+### Fixed
+
+- `robinhood-rwa-addresses` no longer answers a company question with a
+  community token that impersonates it. Robinhood Chain is permissionless and
+  the public token list carries both kinds: two entries are named "GameStop"
+  with symbol `GME`, and the lookup stripped the `• Robinhood Token` suffix —
+  the only thing telling them apart — before ranking, so which address came
+  back was down to list order. Asking for `NET` returned the "NetNet" community
+  token above Cloudflare. The lookup now matches Stock Tokens only (opt back in
+  with `--include-community`, where real listings still rank first), tags every
+  match with `isStockToken`, and reports a `stock_tokens` count. The skill doc's
+  hardcoded "~228 tokens" claim, stale against the 658-entry list, is gone.
+
+- Two clients editing the same project no longer overwrite each other.
+  `projects.update` used to read the whole row, apply the change, and write
+  every column back, so a rename holding a stale row silently reverted a
+  concurrent knowledge save. Updates now write only the fields passed, and the
+  Web UI sends the `updatedAt` it last read so a lost race returns a
+  `project.conflict` error (draft kept, latest version loaded) instead of
+  clobbering. Same-millisecond writes get distinct `updated_at` values, and a
+  unique index on project names (V012) backstops the duplicate-name check
+  under concurrent creates.
+- The Projects page now listens to the gateway's `projects.changed` /
+  `sessions.changed` broadcasts, so another client's create, rename, delete,
+  or session move shows up without pressing Refresh. Moving a session between
+  projects via `sessions.patch` also broadcasts `projects.changed`, keeping
+  other clients' session counts fresh, and the move can no longer be reverted
+  by a simultaneous field patch on storage-only session managers.
+- The Projects page no longer renders its loading and error states as the
+  "No projects yet" empty state (with a create button) — loads show a spinner
+  and failures show the error with a Retry action. Browser back/forward can no
+  longer leak one project's unsaved draft into another project's editor, and
+  a saved knowledge edit no longer flashes the stale pre-save text.
+
+- Router metadata no longer reports a model the provider never ran. An explicit
+  model — a durable `config.agents[].model`, a session pin, or a per-call
+  override — beats the Pilot Router's pick when `PromptAssemblerStage` resolves
+  the final model, but the metadata kept advertising the route as applied, so
+  the Web UI router HUD, the `DoneEvent`, per-turn usage and the savings figures
+  all named the routed model and credited savings for a route the turn never
+  took. The decision is now demoted the same way the `observe` rollout phase
+  already does it (`routing_applied=false`, tier and model kept on the record as
+  advice), and per-turn savings are priced from the model that actually ran —
+  which also corrects the cost basis reported during `observe` (#586).
+- Two provider failures that made whole model families unusable. Requests to
+  the `opencap` and `bankr` provider kinds now carry the required `x-api-key`
+  header on chat completions and model listing, instead of failing with
+  `HTTP 401: API key required for remote API access`. And Gemini reasoning
+  models no longer reject tool calls with `HTTP 400: Function call is missing a
+  thought_signature`: the signature is captured from streamed and non-streamed
+  deltas, carried on `ToolUseEndEvent` / `ContentBlockToolUse` / `ToolCall`
+  through the turn loop, session sanitization and history deserialization, and
+  echoed back when messages are rebuilt (#519).
+- `agentos upgrade` no longer leaves orphaned processes on Windows. On a
+  timeout, `_kill_process_group()` called `proc.kill()`, which terminates only
+  the direct child — grandchildren (compilers, downloads, nested Python runs)
+  survived and kept file locks on the virtualenv. Windows now uses
+  `taskkill /T /F /PID` to kill the whole tree, falling back to `proc.kill()`
+  only if that fails; POSIX still uses `os.killpg` SIGTERM→SIGKILL (#536).
+
+## [2026.8.29] - 2026-08-29
+
+### Added
+
+- Memory Web UI view and knowledge-base document ingestion. The console gets a
+  browsable `/memory` view (sidebar entry, `g m` chord) with a curated-memory
+  editor, a knowledge-base document table, a raw source-file explorer and a
+  semantic search explorer. Behind it, `memory.ingest` grows multi-format text
+  extraction and directory ingestion (PDF, DOCX, PPTX, Markdown, text, CSV,
+  JSON/YAML and code files) over `<workspace>/knowledge_base/`, exposed as
+  `memory.curated.*` and `memory.knowledge_base.*` JSON-RPC methods and as
+  `agentos memory ingest` / `agentos memory curated` on the CLI (#368).
+
+- Email channel (`type = "email"`). A mailbox is now a first-class channel:
+  inbound over IMAP polling, outbound over SMTP with `In-Reply-To`/`References`
+  so replies stay in the originating thread. No platform app registration —
+  just IMAP/SMTP credentials. One mail thread is one session, quoted history is
+  stripped before the text reaches the model, HTML-only mail is flattened to
+  text, and inbound attachments plus generated artifacts ride the shared
+  attachment pipeline under the usual size limits. Access is a required
+  fail-closed `allowed_senders` From-address allowlist (exact addresses or
+  `*@domain` patterns); mail from the agent's own address and anything marked
+  auto-generated (`Auto-Submitted`, `X-Autoreply`, `List-Id`,
+  `Precedence: bulk`) is dropped so an autoresponder cannot start a mail loop
+  (#369).
+
+### Changed
+
+- Channel session keys: a DM-shaped channel whose surface is itself threaded
+  can opt into one session per thread with `metadata['dm_thread_scoped']`.
+  Adapters that do not set it keep one session per peer, so Slack, Discord and
+  Telegram DM keys are unchanged.
+
+### Fixed
+
+- Security: the git tools (`git_status`, `git_diff`, `git_log`, `git_commit`)
+  now mask credentials in their output before it reaches the model. `git_diff`
+  returns working-tree and staged file content verbatim, so a `.env` that was
+  committed once kept reaching the model in cleartext on every diff, while the
+  sibling file surfaces (`read_file`, `grep_search`) already redacted. Masking
+  happens at the one `_run_git` chokepoint, on the sandboxed and subprocess
+  paths and on success and failure alike. The assignment pass runs
+  unconditionally (`code_file=False`) because a diff is arbitrary repository
+  content and the git argv says nothing about what is coming back, and the
+  non-reusable `«redacted:…»` sentinel is used because an agent may pipe a diff
+  straight back through `git apply`.
+- Security: a named credential on a diff line no longer escapes the assignment
+  redaction pass. The token-start anchor did not admit the diff marker, so
+  `+MY_SECRET=…` went unmasked where `MY_SECRET=…` was masked; vendor-prefixed
+  keys were still caught by the shape pass, non-vendor named secrets were not.
+  The anchor now accepts one or two marker columns, covering the combined diff
+  a conflicted merge produces as well as the ordinary unified form.
+- Slack sends and scheduler webhook deliveries now survive a transient network
+  blip. Both routed their HTTP calls straight at `httpx` and failed on the
+  first error; they now go through the same `retry_request` helper Discord
+  already uses (exponential backoff with jitter on 429 — honouring
+  `Retry-After` — 500/502/503/504, connect errors, and read timeouts). Fatal
+  statuses such as 400/401 still fail on the first attempt, and the webhook
+  retry keeps the stock 3-retry/1s-base budget so its worst case stays inside
+  the cron job's own timeout. Note that retrying a read timeout on
+  `chat.postMessage` or a webhook POST can duplicate a delivery the receiver
+  already accepted — the same trade-off Discord has always made; the webhook
+  payload's `jobId` is the receiver's dedupe key.
+
+- Security: `execute_code` output is redacted before it reaches the model.
+  `shell.py` already ran `redact_terminal_output` on every output surface, but
+  `execute_code` bypassed redaction entirely, so a script printing `os.environ`
+  or reading a credential file leaked every secret verbatim into the
+  transcript. Redaction now happens at `_execution_result_json`, the single
+  choke point for all eight return paths (#490).
+- Security: the `image` tool no longer buffers an unbounded response body
+  before checking its size limit. `_fetch_image_url` read `resp.content` in
+  full and only then compared against the 20 MB ceiling, so an oversized or
+  chunked body could exhaust process memory. The response is now streamed and
+  the read stops the moment the accumulated size passes the limit; each
+  redirect hop is still SSRF-checked before its body is read (#506).
+- Security: the GitHub skill-hub source caps blob downloads. `GitHubSource.fetch()`
+  buffered every blob of a skill directory with a non-streaming `client.get`,
+  with no per-blob cap and no total budget, so a hostile repo could push the
+  installer into RAM exhaustion. Blobs are now streamed against a per-blob
+  ceiling (8 MiB) and a cumulative budget (32 MiB), the response is closed in a
+  `finally`, and a blob over the cap fails closed rather than installing a
+  truncated bundle (#510).
+- Scheduler: one-shot `AT` schedules in the past are rejected by
+  `SchedulerOps.add()` and `update()` (5s skew tolerance) instead of being
+  stored with a stale `next_run_at` that fires on the very next tick (#486).
+- Scheduler: `next_due_at` now reports the actual runnable time,
+  `MIN(MAX(next_run_at, backoff_until))`. It previously looked only at
+  `next_run_at` while `iter_due` also waits on `backoff_until`, so after a few
+  failures on a frequent cron the timer woke early, yielded nothing and
+  busy-spun SQLite for the whole backoff window (#537).
+- MCP stdio: the live reader uses `readexactly` instead of `read(n)`, which
+  could return a short buffer and truncate a chunked tool result into a
+  `json.loads` failure; EOF now raises a clear truncated-body error (#537).
+- Telegram: entity offsets are sliced on the UTF-16 grid. Offsets and lengths
+  are UTF-16 code units but were applied to a Python `str` by code point, so an
+  emoji before `/help@mybot` in a group made the bot ignore a command aimed at
+  it (#537).
+- Provider failover: an exhausted fallback chain raises the explicit
+  `IndexError("No more provider fallbacks available")`.
+  `next_fallback_after_failure()` advanced the chain index unbounded and
+  surfaced a bare out-of-range `IndexError` from `_build_provider` (#488).
+- Discord: `_dispatch_loop` keeps dispatching after a reconnect. Opcode 7/9 and
+  a dropped socket reconnected and then returned from the loop — heartbeat
+  resumed and health still read connected, but messages and slash commands were
+  never read again (#538).
+- Setup: cancelling xAI sign-in stops the poll loop. Cancel only reset the
+  visible card, so an expiry could paint an error after dismissal and a
+  restarted sign-in could be wiped by the old loop completing; cancel and start
+  now bump a generation counter (#538).
+- Workspace paths: a real nested `workspace/` folder inside the configured root
+  is no longer stripped. Any absolute path containing a `workspace` segment was
+  rewritten from the last such segment, so reads and writes landed on a sibling
+  file; paths already inside the root are left alone and sandbox
+  `/workspace/...` still remaps (#538).
+- Web UI: the projects page header stacks on mobile instead of overflowing.
+
 ## [2026.8.28] - 2026-08-28
 
 ### Added
@@ -24,6 +940,17 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   transcripts. Existing databases migrate automatically (V011); old sessions
   come up project-less, and deleting a project detaches its sessions instead
   of deleting them.
+
+### Fixed
+
+- Cron: day-of-week `7` is Sunday again, so `0 0 * * 7` schedules Sundays
+  instead of being rejected (#478).
+- Cron: a reversed range in a stepped field (`30-20/5`) is refused up front
+  with a clear error instead of parsing into surprise fire times (#480).
+- Cron: month and day-of-week names are case-insensitive — `jan`, `JAN` and
+  `Jan` are the same month, `sun`/`SUN` the same day (#482).
+- Scheduler: the timezone alias on a legacy expression schedule is honored
+  instead of silently falling back (#485).
 
 ## [2026.8.27] - 2026-08-27
 

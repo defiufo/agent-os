@@ -486,7 +486,9 @@ class ChannelManager:
         - Slack: ``metadata.channel_type in ("channel", "group")``
 
         Group keys use ``msg.channel_id`` as peer_id (per-room session).
-        DM keys use ``msg.sender_id`` as peer_id (per-user session).
+        DM keys use ``msg.sender_id`` as peer_id (per-user session), plus a
+        ``:thread:`` suffix when the adapter opts in with
+        ``metadata['dm_thread_scoped']``.
         """
         meta = getattr(msg, "metadata", {}) or {}
         flag = meta.get("is_group")
@@ -513,9 +515,17 @@ class ChannelManager:
                 return build_thread_key(base_key, thread_id, channel_hint=channel_name)
             return base_key
 
-        return build_direct_key(
+        direct_key = build_direct_key(
             agent_id=agent_id,
             channel=channel_name,
             peer_id=msg.sender_id,
             dm_scope=DmScope.PER_CHANNEL_PEER,
         )
+        # A DM surface can still be threaded — one email peer holds many
+        # independent threads. Opt-in only: an adapter asks for per-thread DM
+        # sessions with ``metadata['dm_thread_scoped']``, so chat adapters that
+        # happen to carry a thread id on a DM keep their per-peer session.
+        dm_thread_id = meta.get("native_thread_id")
+        if meta.get("dm_thread_scoped") and isinstance(dm_thread_id, str) and dm_thread_id:
+            return build_thread_key(direct_key, dm_thread_id, channel_hint=channel_name)
+        return direct_key

@@ -45,10 +45,22 @@ class TestDenylist:
             "AGENTOS_SENSITIVE_PATHS_DISABLED",
             "AGENTOS_SAFE_BIN_ALLOW",
             "AGENTOS_AGENT_PERMISSIONS",
+            "AGENTOS_TRUST_ENV",
             "AGENTOS_HOOKS",
             "AGENTOS_GATEWAY_TOKEN",
             "AGENTOS_STATE_DIR",
             "AGENTOS_GATEWAY_PORT",
+            "AGENTOS_HTTP_DOWNLOAD_LIMIT",
+            # egress steering
+            "AGENTOS_LLM_PROXY",
+            "HTTP_PROXY",
+            "HTTPS_PROXY",
+            "ALL_PROXY",
+            "NO_PROXY",
+            "http_proxy",
+            "https_proxy",
+            "all_proxy",
+            "no_proxy",
         ],
     )
     def test_execution_and_posture_names_are_refused(self, name: str) -> None:
@@ -74,6 +86,61 @@ class TestDenylist:
 
     def test_invalid_name_is_not_writable_even_when_absent_from_denylist(self) -> None:
         assert env_policy.is_writable("1BAD") is False
+
+    def test_proxy_names_are_denied_in_both_conventional_cases(self) -> None:
+        """Libraries honour ``http_proxy`` as readily as ``HTTP_PROXY``.
+
+        Denying only the upper-case spelling would leave the exfiltration path
+        of issue #550 open through the lower-case one.
+        """
+        for upper in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY"):
+            assert upper in env_policy.WRITE_DENYLIST
+            assert upper.lower() in env_policy.WRITE_DENYLIST
+
+    @pytest.mark.parametrize(
+        "name",
+        [
+            "Http_Proxy",
+            "hTTps_PrOxY",
+            "All_Proxy",
+            "No_Proxy",
+            "Agentos_Llm_Proxy",
+        ],
+    )
+    def test_proxy_names_are_denied_in_any_casing(self, name: str) -> None:
+        """Exact-case matching would leave a mixed-case bypass.
+
+        ``agentos.env`` pushes ``.env`` keys into ``os.environ`` verbatim, and
+        ``urllib.request.getproxies_environment()`` — what httpx reads proxies
+        through — lower-cases every name it finds, so ``Http_Proxy`` routes
+        traffic exactly as ``HTTP_PROXY`` does.
+        """
+        assert env_policy.is_writable(name) is False
+        with pytest.raises(EnvPolicyError, match="cannot be written through AgentOS"):
+            env_policy.assert_writable(name)
+
+    def test_case_insensitivity_does_not_leak_to_the_rest_of_the_denylist(self) -> None:
+        """Only the proxy family is matched case-insensitively.
+
+        ``path`` and ``Ld_Preload`` are not names any loader or shell reads, and
+        widening the whole denylist would start refusing ordinary lower-case
+        application variables.
+        """
+        assert env_policy.is_writable("path") is True
+        assert env_policy.is_writable("Ld_Preload") is True
+
+    def test_trust_env_cannot_be_written(self) -> None:
+        """``AGENTOS_TRUST_ENV`` gates whether the ambient ``*_PROXY`` names are
+        honoured at all, so a writable value re-opens the same route."""
+        with pytest.raises(EnvPolicyError, match="cannot be written through AgentOS"):
+            env_policy.assert_writable("AGENTOS_TRUST_ENV")
+
+    def test_llm_proxy_cannot_be_written_while_llm_settings_still_can(self) -> None:
+        """The denial is name-by-name, not a block on the LLM config family."""
+        with pytest.raises(EnvPolicyError, match="cannot be written through AgentOS"):
+            env_policy.assert_writable("AGENTOS_LLM_PROXY")
+        env_policy.assert_writable("AGENTOS_LLM_BASE_URL")
+        env_policy.assert_writable("AGENTOS_LLM_MODEL")
 
 
 class TestSanitizeValue:

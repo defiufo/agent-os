@@ -64,6 +64,7 @@ These require no auth and are safe for load balancers and container probes.
 | `GET` | `/api/agents` | List durable agents. |
 | `GET` | `/api/cron` | List scheduled jobs. |
 | `GET` | `/api/usage` | Token usage and cost breakdown. |
+| `GET` | `/metrics` | Prometheus metrics exposition (`observability.metrics_path`). |
 
 ## Channels
 
@@ -80,6 +81,13 @@ These require no auth and are safe for load balancers and container probes.
 | `POST` | `/api/approvals/settings` | Set mode (`prompt` / `auto-approve` / `auto-deny`). |
 | `POST` | `/api/approvals/resolve` | Approve or deny a pending item. |
 | `POST` | `/api/elevated-mode` | Set per-session elevated mode (admitted Control connection only). |
+
+`GET /api/approvals` serializes every pending command and its arguments, so it
+is rate limited per client IP like the rest of `/api/*` — just in its own
+bucket, because the Web UI polls it every 1.5s. The cap is
+`AGENTOS_RATE_APPROVALS_MAX_REQUESTS` (default 300 per
+`AGENTOS_RATE_WINDOW_SECONDS`, i.e. 300/min), which clears several open tabs.
+Raise it only if you run more consoles than that against one gateway.
 
 ## Files and Media
 
@@ -107,6 +115,10 @@ Projects (session groups with shared knowledge) are WebSocket-only:
 `projects.create` / `projects.list` / `projects.get` / `projects.update` /
 `projects.delete` (params use `projectId`, `agentId`, `name`, `knowledge`;
 delete responds with `sessionsCleared` — sessions are detached, not deleted).
+`projects.update` writes only the fields you pass and accepts an optional
+`expectedUpdatedAt` (the `updatedAt` you last read): when the row changed in
+between, the call fails with code `project.conflict` instead of silently
+overwriting the other writer's edit.
 `sessions.create` accepts an optional `projectId`, `sessions.patch` moves a
 session with `projectId` (explicit `null` detaches), and `sessions.list`
 accepts a `projectId` filter and emits `project_id`/`projectId` on every row.

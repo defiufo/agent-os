@@ -200,13 +200,19 @@ export const chat = defineNamespace('chat', {
   agentError: 'Agent error',
   streamGap: 'Stream connection gap detected; reconnecting.',
 
-  // Transcript: artifacts + charts.
+  // Transcript: artifacts + charts + cards.
   artifactDownload: 'Download',
   artifactDownloadTitle: 'Download {name}',
   chartLoading: 'Loading chart…',
   chartUnavailable: 'Chart data is unavailable.',
   chartUnreadable: 'Chart data could not be read.',
   chartFailed: 'Chart failed to load.',
+  cardsLoading: 'Loading results…',
+  cardsUnavailable: 'Result data is unavailable.',
+  cardsUnreadable: 'Result data could not be read.',
+  cardsFailed: 'Results failed to load.',
+  cardsCopy: 'Copy',
+  cardsOverflow: '+{count} more not shown',
 
   // Transcript: history paging.
   historyLoadingEarlier: 'Loading earlier messages...',

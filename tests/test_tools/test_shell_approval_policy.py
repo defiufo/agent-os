@@ -857,3 +857,27 @@ async def test_bypass_does_not_override_safe_bin_hard_denies() -> None:
 
     with pytest.raises(ToolError, match="command blocked by policy"):
         await shell.exec_command("Clear-Disk")
+
+
+@pytest.mark.asyncio
+async def test_root_wipe_is_hard_blocked_at_the_exec_approval_boundary() -> None:
+    """Issue #563 at the real entry point: ``rm -rf /`` must never reach the
+    approval prompt, and ``/elevated bypass`` must not lift the floor."""
+    ctx = current_tool_context.get()
+    assert ctx is not None
+    ctx.elevated = "bypass"
+
+    for command in ("rm -rf /", "rm -rf /*", "rm /tmp/ok && rm -rf /"):
+        result = await shell._check_exec_approval(
+            "exec_command",
+            command,
+            None,
+            "command requires approval",
+            None,
+            True,
+        )
+
+        assert result is not None, command
+        assert result["status"] == "blocked"
+        assert result["reason"] == "sensitive_path"
+        assert result["sensitive_path"] == "/"

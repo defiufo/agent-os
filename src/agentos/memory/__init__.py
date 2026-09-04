@@ -9,6 +9,12 @@ from .embedding import (
     OpenAIEmbeddingProvider,
     chunk_text,
 )
+from .ingest import (
+    IngestDocumentResult,
+    extract_document_text,
+    ingest_directory,
+    ingest_document,
+)
 from .manager import MemoryManager, build_memory_managers
 from .meta import MemoryIndexMeta
 from .retrieval import MemoryRetriever
@@ -48,7 +54,11 @@ __all__ = [
     # sync manager
     "MemorySyncManager",
     "SessionDeltaTracker",
-    # flush
+    # ingest
+    "IngestDocumentResult",
+    "extract_document_text",
+    "ingest_directory",
+    "ingest_document",
     # meta
     "MemoryIndexMeta",
 ]

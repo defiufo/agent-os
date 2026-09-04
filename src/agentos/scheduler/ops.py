@@ -33,6 +33,11 @@ from .types import (
     SessionTarget,
 )
 
+# Hard cap on job timeout_seconds. A single cron create/update with a huge
+# value would hold a model turn open indefinitely (scheduler DoS); negative
+# values make asyncio.wait_for run the handler with no wait at all.
+_MAX_JOB_TIMEOUT_SECONDS = 24 * 60 * 60  # 24h
+
 
 def _resolve_script_placeholder(job: CronJob) -> None:
     """Replace ``{job_id}`` in the job's script path with the job's own id.
@@ -155,6 +160,9 @@ def _normalize_delivery_for_target(
 ) -> DeliveryConfig:
     if delivery is not None and delivery.mode == DeliveryMode.WEBHOOK:
         validate_webhook_url(delivery.webhook_url)
+    fd = delivery.failure_destination if delivery is not None else None
+    if fd is not None and fd.mode == DeliveryMode.WEBHOOK:
+        validate_webhook_url(fd.webhook_url)
     if session_target != SessionTarget.MAIN:
         return delivery
     # Webhook delivery is allowed for any sessionTarget — the heartbeat
@@ -242,11 +250,7 @@ class SchedulerOps:
         # fall back to ISOLATED instead of failing creation. Headless cron
         # callers (no session context) get an isolated run rather than a hard
         # error.
-        if (
-            session_target == SessionTarget.CURRENT
-            and not session_key
-            and not origin_session_key
-        ):
+        if session_target == SessionTarget.CURRENT and not session_key and not origin_session_key:
             session_target = SessionTarget.ISOLATED
 
         origin_session_key = normalize_origin_session_key(session_target, origin_session_key)
@@ -267,6 +271,20 @@ class SchedulerOps:
             delivery=delivery or DeliveryConfig(),
             explicit_delivery=delivery is not None,
         )
+
+        # Bound timeout_seconds: a negative or absurdly large value would make
+        # asyncio.wait_for run the handler with no wait at all (<=0) or hold a
+        # model turn open for years (huge), a reliable scheduler DoS via a
+        # single cron create/update call.
+        if timeout_seconds is None or timeout_seconds < 1:
+            raise ValueError(
+                f"timeout_seconds must be >= 1, got {timeout_seconds!r}"
+            )
+        if timeout_seconds > _MAX_JOB_TIMEOUT_SECONDS:
+            raise ValueError(
+                f"timeout_seconds must be <= {_MAX_JOB_TIMEOUT_SECONDS}, "
+                f"got {timeout_seconds!r}"
+            )
 
         job = CronJob(
             name=name,
@@ -291,7 +309,20 @@ class SchedulerOps:
 
         if kind == ScheduleKind.AT:
             job.delete_after_run = True
-            job.next_run_at = datetime.fromisoformat(cron_expr)
+            at_dt = datetime.fromisoformat(cron_expr)
+            # An AT one-shot whose timestamp is in the past is due on the very
+            # next tick, so it would fire immediately with whatever prompt the
+            # operator typed — a stale payload running right after create is
+            # never what a one-shot is for (use EVERY/cron for that). Refuse
+            # with a small skew tolerance instead of silently scheduling a
+            # job that is already due.
+            if at_dt < now - timedelta(seconds=5):
+                raise ValueError(
+                    f"AT schedule is in the past ({cron_expr}); a one-shot job "
+                    "cannot fire `now`. Use a cron/`every` schedule for repeating "
+                    "work, or an AT timestamp in the future."
+                )
+            job.next_run_at = at_dt
         elif kind == ScheduleKind.EVERY and cron_expr.isdigit():
             # Anchor-based interval: record the anchor so subsequent fires
             # align to it rather than drifting with each run.
@@ -339,7 +370,16 @@ class SchedulerOps:
             job.delete_after_run = kind == ScheduleKind.AT
             if kind == ScheduleKind.AT:
                 job.anchor_at = None
-                job.next_run_at = datetime.fromisoformat(cron_expr)
+                at_dt = datetime.fromisoformat(cron_expr)
+                # Same past-timestamp guard as `add`: a one-shot being edited
+                # onto a past time is due on the next tick and would fire
+                # immediately with a stale payload.
+                if at_dt < now - timedelta(seconds=5):
+                    raise ValueError(
+                        f"AT schedule is in the past ({cron_expr}); a one-shot "
+                        "job cannot fire `now`."
+                    )
+                job.next_run_at = at_dt
             elif kind == ScheduleKind.EVERY:
                 job.anchor_at = now
                 job.next_run_at = now + timedelta(seconds=int(cron_expr))
@@ -354,6 +394,13 @@ class SchedulerOps:
 
         for field in ("name", "timeout_seconds", "enabled", "origin_session_key"):
             if field in patch:
+                if field == "timeout_seconds":
+                    value = patch[field]
+                    if value is None or value < 1 or value > _MAX_JOB_TIMEOUT_SECONDS:
+                        raise ValueError(
+                            f"timeout_seconds must be 1..{_MAX_JOB_TIMEOUT_SECONDS}, "
+                            f"got {value!r}"
+                        )
                 setattr(job, field, patch.pop(field))
         # Validated after normalize_contract below: a patch that converts the
         # job's kind also moves its handler_key, and the elevation rule is

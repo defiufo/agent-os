@@ -21,6 +21,7 @@ from agentos.scheduler.types import (
     SessionTarget,
 )
 from agentos.session.keys import parse_agent_id
+from agentos.tools.ssrf import assert_not_metadata_endpoint
 
 log = structlog.get_logger(__name__)
 
@@ -28,9 +29,7 @@ SCRIPT_HANDLER_KEY = "script_run"
 
 
 _WEBHOOK_TIMEOUT_SECONDS = 10.0
-_REPLY_DIRECTIVE_RE = re.compile(
-    r"\[\[\s*(?:reply_to_current|reply_to\s*:\s*[^\]\n]+)\s*\]\]\s*"
-)
+_REPLY_DIRECTIVE_RE = re.compile(r"\[\[\s*(?:reply_to_current|reply_to\s*:\s*[^\]\n]+)\s*\]\]\s*")
 
 
 def strip_reply_directives(text: str | None) -> str | None:
@@ -40,7 +39,14 @@ def strip_reply_directives(text: str | None) -> str | None:
 
 
 def validate_webhook_url(url: str) -> None:
-    """Raise ValueError if ``url`` is not a syntactically valid http(s) URL."""
+    """Raise ValueError if ``url`` is not a syntactically valid http(s) URL.
+
+    Localhost and LAN hooks are allowed — operators point cron at n8n and
+    similar. Cloud metadata endpoints are not: they hand out instance
+    credentials, and ``http_request`` already refuses them for the same
+    reason. Reuse that floor so a webhook cannot be the SSRF hole the
+    fetch tools closed.
+    """
     if not url:
         raise ValueError("webhook URL is required")
     try:
@@ -48,11 +54,11 @@ def validate_webhook_url(url: str) -> None:
     except ValueError as exc:
         raise ValueError(f"invalid webhook URL: {url!r}") from exc
     if parsed.scheme not in ("http", "https"):
-        raise ValueError(
-            f"webhook URL must use http or https scheme, got {parsed.scheme!r}"
-        )
+        raise ValueError(f"webhook URL must use http or https scheme, got {parsed.scheme!r}")
     if not parsed.hostname:
         raise ValueError(f"webhook URL is missing a hostname: {url!r}")
+    # SSRFBlockedError is a ValueError, so add/update callers keep working.
+    assert_not_metadata_endpoint(url)
 
 
 # The origin webchat session a job was born in no longer exists. Deliberately
@@ -499,6 +505,8 @@ class DeliveryChain:
 
         import httpx
 
+        from agentos.channels._util import retry_request
+
         headers = {"Content-Type": "application/json"}
         if token:
             headers["Authorization"] = f"Bearer {token}"
@@ -510,7 +518,10 @@ class DeliveryChain:
         }
         try:
             async with httpx.AsyncClient(timeout=_WEBHOOK_TIMEOUT_SECONDS) as client:
-                response = await client.post(url, json=payload, headers=headers)
+                # retry_request's defaults (3 retries, 1s base) keep the worst
+                # case near 7s plus jitter — inside the job's own timeout
+                # budget, whose slot is held while we back off.
+                response = await retry_request(client.post, url, json=payload, headers=headers)
                 response.raise_for_status()
             log.info("delivery.webhook_sent", job_id=job_id)
             return "delivered"

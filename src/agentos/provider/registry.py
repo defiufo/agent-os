@@ -122,6 +122,14 @@ for _provider_spec in [
         model_catalog_url="https://gw.capminal.ai/api/public/models",
     ),
     _spec(
+        "surplus",
+        "openai_compat",
+        "surplus",
+        "SURPLUS_API_KEY",
+        "https://api.surplusintelligence.ai/v1",
+        model_catalog_url="https://api.surplusintelligence.ai/v1/models",
+    ),
+    _spec(
         "openrouter",
         "openai_compat",
         "openrouter",

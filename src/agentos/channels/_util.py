@@ -9,11 +9,15 @@ describe their admit/deny semantics. Item-5 adapter adoptions wire the
 from __future__ import annotations
 
 import asyncio
+import math
+import os
 import random
 import time
 from collections import OrderedDict
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
+from email.utils import parsedate_to_datetime
 from typing import Any, Literal
 
 import httpx
@@ -271,6 +275,65 @@ class FloodStrikeBackoff:
         self._fallback = False
 
 
+#: Upper bound on a server-supplied ``Retry-After``. The header is remote input
+#: and a provider can legally ask for hours; a channel send parked that long is
+#: worse for the caller than one that comes back rate-limited.
+MAX_RETRY_AFTER_S = 300.0
+
+
+def _retry_after_delay(header: str | None, fallback: float) -> float:
+    """Resolve a ``Retry-After`` header to a sleep in seconds.
+
+    RFC 7231 §7.1.3 allows either delay-seconds or an HTTP-date, so a bare
+    ``float()`` turns a date-formatted rate-limit into a ``ValueError`` inside
+    the retry loop. Anything that parses as neither — and any value that is
+    negative, non-finite or already in the past — falls back to the caller's
+    computed backoff; a usable value is clamped to ``MAX_RETRY_AFTER_S``.
+    """
+    if header is None:
+        return fallback
+    raw = header.strip()
+    if not raw:
+        return fallback
+    try:
+        delay = float(raw)
+    except ValueError:
+        try:
+            when = parsedate_to_datetime(raw)
+        except (TypeError, ValueError):
+            return fallback
+        # An HTTP-date carries no offset other than GMT (RFC 7231 §7.1.1.1).
+        if when.tzinfo is None:
+            when = when.replace(tzinfo=UTC)
+        delay = (when - datetime.now(UTC)).total_seconds()
+    if not math.isfinite(delay) or delay < 0.0:
+        return fallback
+    return min(delay, MAX_RETRY_AFTER_S)
+
+
+def check_channel_file_size(
+    path: str | os.PathLike[str],
+    limit_bytes: int,
+    adapter_name: str,
+) -> int:
+    """Check that *path* does not exceed *limit_bytes*.
+
+    Returns the file size in bytes on success.
+    Raises ValueError with an actionable message if the file exceeds the ceiling.
+    """
+    try:
+        size = os.path.getsize(path)
+    except OSError as exc:
+        raise ValueError(f"Cannot read file size for {path}: {exc}") from exc
+    if size > limit_bytes:
+        limit_mb = limit_bytes // (1024 * 1024)
+        raise ValueError(
+            f"File too large: {size:,} bytes exceeds {adapter_name} "
+            f"{limit_mb} MB upload ceiling ({limit_bytes:,} bytes)"
+        )
+    return size
+
+
 async def retry_request(
     func: Callable[..., Awaitable[httpx.Response]],
     *args: Any,
@@ -283,8 +346,13 @@ async def retry_request(
     for attempt in range(max_retries + 1):
         try:
             resp = await func(*args, **kwargs)
-            if resp.status_code == 429:
-                retry_after = float(resp.headers.get("Retry-After", base_delay * (2**attempt)))
+            # Guarded like the 5xx branch below: on the final attempt the
+            # rate-limited response is handed back instead of being slept on
+            # and then discarded by the ``exhausted`` raise.
+            if resp.status_code == 429 and attempt < max_retries:
+                retry_after = _retry_after_delay(
+                    resp.headers.get("Retry-After"), base_delay * (2**attempt)
+                )
                 log.warning("rate_limited", retry_after=retry_after, attempt=attempt)
                 await asyncio.sleep(retry_after)
                 continue
@@ -294,7 +362,11 @@ async def retry_request(
                 await asyncio.sleep(delay)
                 continue
             return resp
-        except (httpx.ConnectError, httpx.ReadTimeout) as exc:
+        # ``ConnectTimeout``/``WriteTimeout``/``PoolTimeout`` descend from
+        # ``TimeoutException``, a sibling of ``ConnectError`` under
+        # ``TransportError`` — naming ``ReadTimeout`` alone let a DNS, TLS or
+        # pool timeout escape the backoff entirely.
+        except (httpx.ConnectError, httpx.TimeoutException) as exc:
             last_exc = exc
             if attempt < max_retries:
                 delay = base_delay * (2**attempt) + random.random()

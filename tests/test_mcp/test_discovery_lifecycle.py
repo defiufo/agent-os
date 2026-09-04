@@ -112,6 +112,76 @@ async def test_disconnect_unregisters_tools_owned_by_server(
 
 
 @pytest.mark.asyncio
+async def test_disconnect_older_server_preserves_newer_same_named_tool(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from agentos.mcp import discovery
+
+    older_config = MCPServerConfig(name="older", transport="stdio", command="mock-mcp")
+    newer_config = MCPServerConfig(name="newer", transport="stdio", command="mock-mcp")
+    tool = MCPToolDef(
+        name="lookup",
+        description="Lookup",
+        input_schema={"properties": {}, "required": []},
+    )
+    older_client = FakeMCPClient(older_config, tools=[tool])
+    newer_client = FakeMCPClient(newer_config, tools=[tool])
+    clients = iter((older_client, newer_client))
+    monkeypatch.setattr(discovery, "create_client", lambda _config: next(clients))
+    registry = ToolRegistry()
+
+    await discovery.discover_and_register(older_config, registry, owner="older")
+    older_registration = registry.get("mcp_lookup")
+    assert older_registration is not None
+    older_handler = older_registration.handler
+    await discovery.discover_and_register(newer_config, registry, owner="newer")
+    newer_registration = registry.get("mcp_lookup")
+    assert newer_registration is not None
+    newer_handler = newer_registration.handler
+
+    assert newer_handler is not older_handler
+    assert await discovery.disconnect_and_unregister("older", registry) == 1
+    registered = registry.get("mcp_lookup")
+    assert registered is not None
+    assert registered.handler is newer_handler
+    assert older_client.closed is True
+    assert newer_client.closed is False
+
+
+@pytest.mark.asyncio
+async def test_disconnect_newer_server_restores_older_same_named_tool(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from agentos.mcp import discovery
+
+    older_config = MCPServerConfig(name="older", transport="stdio", command="mock-mcp")
+    newer_config = MCPServerConfig(name="newer", transport="stdio", command="mock-mcp")
+    tool = MCPToolDef(
+        name="lookup",
+        description="Lookup",
+        input_schema={"properties": {}, "required": []},
+    )
+    older_client = FakeMCPClient(older_config, tools=[tool])
+    newer_client = FakeMCPClient(newer_config, tools=[tool])
+    clients = iter((older_client, newer_client))
+    monkeypatch.setattr(discovery, "create_client", lambda _config: next(clients))
+    registry = ToolRegistry()
+
+    await discovery.discover_and_register(older_config, registry, owner="older")
+    older_registration = registry.get("mcp_lookup")
+    assert older_registration is not None
+    older_handler = older_registration.handler
+    await discovery.discover_and_register(newer_config, registry, owner="newer")
+
+    assert await discovery.disconnect_and_unregister("newer", registry) == 1
+    registered = registry.get("mcp_lookup")
+    assert registered is not None
+    assert registered.handler is older_handler
+    assert older_client.closed is False
+    assert newer_client.closed is True
+
+
+@pytest.mark.asyncio
 async def test_failed_mcp_discovery_closes_client_without_leaking(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

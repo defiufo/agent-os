@@ -278,6 +278,7 @@ _ASSIGNMENT_RE = re.compile(
     r"""(?ix)
     (?:^|[\s"'{,(])                     # start of a token
     (?:\d+\t)?                          # grep -n line prefix
+    (?:[+\-]{1,2})?                     # diff marker: unified +/-, combined ++/--
     ([A-Za-z][A-Za-z0-9_.\-]{0,64})     # name
     ['\"]?                              # closing quote of a JSON/YAML key
     \s*[:=]\s*

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import threading
 import uuid
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -23,8 +24,12 @@ def _utc_ts() -> str:
     return datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-def _default_log_dir() -> Path:
+def default_log_dir() -> Path:
+    """Return the default directory for log and trace JSONL files."""
     return Path(os.environ.get(LOG_DIR_ENV, str(default_agentos_home() / "logs")))
+
+
+_default_log_dir = default_log_dir
 
 
 @dataclass(frozen=True, slots=True)
@@ -160,8 +165,7 @@ class TraceEvent:
 class TraceSink(Protocol):
     """Minimal sink protocol for trace event consumers."""
 
-    def write(self, event: TraceEvent) -> None:
-        ...
+    def write(self, event: TraceEvent) -> None: ...
 
 
 class MemoryTraceSink:
@@ -201,15 +205,50 @@ class PrivacyGuardSink:
         self.sink.write(event)
 
 
+_ACTIVE_TRACE_SINKS: list[TraceSink] = []
+_ACTIVE_TRACE_SINKS_LOCK = threading.Lock()
+
+
+def register_trace_sink(sink: TraceSink) -> None:
+    """Register an active trace sink for runtime event fan-out."""
+    with _ACTIVE_TRACE_SINKS_LOCK:
+        if sink not in _ACTIVE_TRACE_SINKS:
+            _ACTIVE_TRACE_SINKS.append(sink)
+
+
+def unregister_trace_sink(sink: TraceSink) -> None:
+    """Unregister an active trace sink."""
+    with _ACTIVE_TRACE_SINKS_LOCK:
+        if sink in _ACTIVE_TRACE_SINKS:
+            _ACTIVE_TRACE_SINKS.remove(sink)
+
+
+def get_trace_sinks() -> list[TraceSink]:
+    """Return a snapshot of all currently registered trace sinks."""
+    with _ACTIVE_TRACE_SINKS_LOCK:
+        return list(_ACTIVE_TRACE_SINKS)
+
+
+def clear_trace_sinks() -> None:
+    """Unregister all trace sinks (useful for test isolation)."""
+    with _ACTIVE_TRACE_SINKS_LOCK:
+        _ACTIVE_TRACE_SINKS.clear()
+
+
 def write_trace_event(
     event: TraceEvent,
     log_dir: Path | None = None,
     *,
     allow_raw: bool = False,
 ) -> Path:
-    """Append one trace event and return the file path written."""
-
-    return _append_trace_event(event, log_dir or _default_log_dir(), allow_raw=allow_raw)
+    """Append one trace event to disk and dispatch to all registered sinks."""
+    path = _append_trace_event(event, log_dir or default_log_dir(), allow_raw=allow_raw)
+    for sink in get_trace_sinks():
+        try:
+            sink.write(event)
+        except Exception:
+            pass
+    return path
 
 
 def load_trace_events(trace_id: str, log_dir: Path | None = None) -> list[TraceEvent]:

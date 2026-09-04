@@ -2,8 +2,13 @@
 
 Projects group chat sessions across agents; each project's ``knowledge``
 text is injected into the system prompt of every member session. These
-tools let the agent manage projects from prompting — the same operations
-the ``projects.*`` RPC surface exposes to the Web UI and CLI.
+tools let the agent manage projects from prompting, but — unlike the
+``projects.*`` RPC surface the Web UI and CLI use — they are scoped to the
+calling session: knowledge is readable and writable only for the project
+the calling session belongs to, and only the calling session itself can be
+moved. Knowledge a tool call writes lands in the system prompt of every
+member session, so an unscoped surface would hand any prompt-injected
+instruction a persistent, cross-project write primitive.
 """
 
 from __future__ import annotations
@@ -51,6 +56,15 @@ def _resolve_agent_id(agent_id: str | None) -> str:
 def _current_session_key() -> str | None:
     ctx = current_tool_context.get()
     return getattr(ctx, "session_key", None) if ctx else None
+
+
+async def _calling_session_project_id(mgr: object) -> str | None:
+    """Project of the calling session, or None (no session / not in a project)."""
+    session_key = _current_session_key()
+    if not session_key:
+        return None
+    node = await mgr.get_session(session_key)  # type: ignore[attr-defined]
+    return getattr(node, "project_id", None) if node is not None else None
 
 
 # ---------------------------------------------------------------------------
@@ -109,11 +123,14 @@ async def projects_create(
 
 @tool(
     name="projects_list",
-    description="List projects (with per-project session counts).",
+    description=(
+        "List projects (with per-project session counts). Knowledge text is "
+        "included only for the calling session's own project."
+    ),
     params={
         "agent_id": {
             "type": "string",
-            "description": "Filter by owning agent ID (defaults to all agents).",
+            "description": "Filter by default agent ID (defaults to all agents).",
         },
     },
     required=[],
@@ -122,6 +139,12 @@ async def projects_list(agent_id: str | None = None) -> str:
     try:
         mgr = _get_session_manager()
         projects = await mgr.list_projects(agent_id=agent_id or None)
+        # Knowledge feeds member sessions' system prompts; exposing every
+        # project's text would let one injected session read them all.
+        own_project = await _calling_session_project_id(mgr)
+        for row in projects:
+            if row.get("project_id") != own_project:
+                row.pop("knowledge", None)
         return json.dumps(projects, ensure_ascii=False)
     except ToolError:
         raise
@@ -137,13 +160,16 @@ async def projects_list(agent_id: str | None = None) -> str:
 @tool(
     name="projects_update",
     description=(
-        "Rename a project and/or replace its shared knowledge text. Member "
-        "sessions pick up the new knowledge on their next turn."
+        "Rename the calling session's project and/or replace its shared "
+        "knowledge text. Member sessions pick up the new knowledge on their "
+        "next turn. Only the project this session belongs to can be updated; "
+        "other projects are managed from the Web UI or the `agentos projects` "
+        "CLI."
     ),
     params={
         "project_id": {
             "type": "string",
-            "description": "Project ID to update.",
+            "description": "Project ID to update (must be the calling session's project).",
         },
         "name": {
             "type": "string",
@@ -167,6 +193,15 @@ async def projects_update(
         raise ToolError("Provide name and/or knowledge to update")
     try:
         mgr = _get_session_manager()
+        # Checked before existence so foreign project ids are neither
+        # writable nor probeable from a prompt.
+        own_project = await _calling_session_project_id(mgr)
+        if own_project is None or project_id.strip() != own_project:
+            raise ToolError(
+                "projects_update can only edit the project the calling session "
+                "belongs to; manage other projects from the Web UI or the "
+                "`agentos projects` CLI"
+            )
         project = await mgr.update_project(project_id.strip(), name=name, knowledge=knowledge)
         return json.dumps(project, ensure_ascii=False)
     except (ToolError, ValueError):
@@ -185,8 +220,9 @@ async def projects_update(
 @tool(
     name="projects_move_session",
     description=(
-        "Move a session into a project, or detach it by omitting project_id. "
-        "Defaults to the calling session when session_key is omitted."
+        "Move the calling session into a project, or detach it by omitting "
+        "project_id. Only the calling session can be moved; move other "
+        "sessions from the Web UI or the `agentos projects` CLI."
     ),
     params={
         "project_id": {
@@ -195,7 +231,7 @@ async def projects_update(
         },
         "session_key": {
             "type": "string",
-            "description": "Session to move (defaults to the calling session).",
+            "description": "Optional; must match the calling session when provided.",
         },
     },
     required=[],
@@ -204,9 +240,18 @@ async def projects_move_session(
     project_id: str | None = None,
     session_key: str | None = None,
 ) -> str:
-    resolved_key = (session_key or "").strip() or _current_session_key()
-    if not resolved_key:
-        raise ToolError("session_key is required (no calling session available)")
+    calling_key = _current_session_key()
+    if not calling_key:
+        raise ToolError("projects_move_session requires a calling session")
+    requested_key = (session_key or "").strip()
+    if requested_key and requested_key != calling_key:
+        # Moving a foreign session would pull this project's knowledge into
+        # that session's system prompt — an injection hand-off, so refuse.
+        raise ToolError(
+            "projects_move_session can only move the calling session; move "
+            "other sessions from the Web UI or the `agentos projects` CLI"
+        )
+    resolved_key = calling_key
     try:
         mgr = _get_session_manager()
         node = await mgr.move_session_to_project(

@@ -97,6 +97,37 @@ def is_loopback_bind(host: str | None) -> bool:
     return host == "localhost" or is_loopback_address(host)
 
 
+def parse_trusted_proxy_set(trusted_proxy: str | None) -> frozenset[str]:
+    """Parse the ``auth.trusted_proxy`` CSV into a normalized IP set.
+
+    Shared by the HTTP middleware (peer admission) and the RPC auth layer
+    (per-connection admission) so the two gates cannot drift in how they
+    normalize a configured proxy address (case, whitespace, IPv6 brackets).
+    """
+    if not trusted_proxy:
+        return frozenset()
+    return frozenset(p.strip().lower().strip("[]") for p in trusted_proxy.split(",") if p.strip())
+
+
+def normalize_peer_ip(peer_ip: str | None) -> str:
+    """Normalize a transport peer address for trusted-proxy comparison.
+
+    Lowercase, bracket-stripped for IPv6 literals; empty string when missing
+    so callers can compare against a normalized trusted set directly.
+    """
+    return (peer_ip or "").strip().lower().strip("[]")
+
+
+def peer_is_trusted_proxy(trusted_proxy: str | None, peer_ip: str | None) -> bool:
+    """True when the transport ``peer_ip`` is in the trusted-proxy set.
+
+    This is the single shared gate: admission (HTTP middleware and RPC auth)
+    requires it, and X-Forwarded-For consumption requires it — a header from
+    any other peer is never honored.
+    """
+    return normalize_peer_ip(peer_ip) in parse_trusted_proxy_set(trusted_proxy)
+
+
 __all__ = [
     "CHANNEL_RPC_METHODS",
     "CONTROL_AND_CHANNEL",
@@ -107,4 +138,7 @@ __all__ = [
     "is_loopback_address",
     "is_loopback_bind",
     "normalize_audiences",
+    "normalize_peer_ip",
+    "parse_trusted_proxy_set",
+    "peer_is_trusted_proxy",
 ]

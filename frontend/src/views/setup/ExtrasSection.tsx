@@ -316,6 +316,15 @@ function XaiLoginButton({ disabled, signedIn }: { disabled: boolean; signedIn: b
     }
   }, [])
 
+  // Generation counter for the login flow. Bumped on Cancel and on every new
+  // start; an in-flight poll carries the generation it was created under and
+  // stops touching UI the moment it goes stale. Without this, Cancel only
+  // reset the visible state — the old loop kept polling in the background, so
+  // a later server-side expiry repainted the idle card with an error the
+  // operator had already dismissed, and a restarted sign-in raced the old
+  // loop's completion (which wiped the fresh awaiting UI mid-login).
+  const flowRef = useRef(0)
+
   const fail = (message: string, action: 'signIn' | 'signOut' = 'signIn') => {
     if (cancelled.current) return
     setPhase('error')
@@ -327,14 +336,14 @@ function XaiLoginButton({ disabled, signedIn }: { disabled: boolean; signedIn: b
   const errorLabel = () =>
     errorAction === 'signOut' ? t('setup.xSearchSignOutFailed') : t('setup.xSearchLoginFailed')
 
-  const poll = async (pending: XaiPendingLogin, wait: number) => {
+  const poll = async (pending: XaiPendingLogin, wait: number, flow: number) => {
     await new Promise((resolve) => window.setTimeout(resolve, wait * 1000))
-    if (cancelled.current) return
+    if (cancelled.current || flow !== flowRef.current) return
     try {
       const result = await rpc.call<XaiLoginPoll>('auth.xai.login.poll', {
         loginId: pending.loginId,
       })
-      if (cancelled.current) return
+      if (cancelled.current || flow !== flowRef.current) return
       if (result?.status === 'complete') {
         setPhase('idle')
         setLogin(null)
@@ -346,8 +355,9 @@ function XaiLoginButton({ disabled, signedIn }: { disabled: boolean; signedIn: b
         fail(t('setup.xSearchLoginExpired'))
         return
       }
-      void poll(pending, pollDelay(result?.interval, pending.interval))
+      void poll(pending, pollDelay(result?.interval, pending.interval), flow)
     } catch (err) {
+      if (cancelled.current || flow !== flowRef.current) return
       fail(err instanceof Error ? err.message : String(err))
     }
   }
@@ -364,19 +374,21 @@ function XaiLoginButton({ disabled, signedIn }: { disabled: boolean; signedIn: b
   }
 
   const start = async () => {
+    const flow = ++flowRef.current
     setPhase('starting')
     setErrorMessage('')
     try {
       const pending = await rpc.call<XaiPendingLogin>('auth.xai.login.start')
-      if (cancelled.current) return
+      if (cancelled.current || flow !== flowRef.current) return
       if (!pending?.loginId) {
         fail(t('setup.xSearchLoginExpired'))
         return
       }
       setLogin(pending)
       setPhase('awaiting')
-      void poll(pending, pollDelay(pending.interval, DEFAULT_POLL_SECONDS))
+      void poll(pending, pollDelay(pending.interval, DEFAULT_POLL_SECONDS), flow)
     } catch (err) {
+      if (cancelled.current || flow !== flowRef.current) return
       fail(err instanceof Error ? err.message : String(err))
     }
   }
@@ -403,6 +415,10 @@ function XaiLoginButton({ disabled, signedIn }: { disabled: boolean; signedIn: b
           type="button"
           variant="outline"
           onClick={() => {
+            // Invalidate any in-flight poll before dropping the visible UI —
+            // otherwise the abandoned loop kept polling and could repaint this
+            // card (an expiry error, or a late completion) after the cancel.
+            flowRef.current += 1
             setPhase('idle')
             setLogin(null)
           }}

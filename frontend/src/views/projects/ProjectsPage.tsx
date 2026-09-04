@@ -41,9 +41,10 @@ interface AgentsList {
 
 // Mirrors PROJECT_NAME_MAX_CHARS / PROJECT_KNOWLEDGE_MAX_CHARS in
 // src/agentos/session/manager.py — the gateway rejects past these, so stop
-// the inputs there instead of failing on save.
+// the inputs there instead of failing on save. The knowledge cap equals the
+// per-turn injection ceiling: everything that saves reaches the prompt.
 const PROJECT_NAME_MAX = 200
-const PROJECT_KNOWLEDGE_MAX = 32_000
+const PROJECT_KNOWLEDGE_MAX = 24_000
 
 // ── Create-project dialog ────────────────────────────────────────────────────
 function CreateProjectDialog({
@@ -203,6 +204,23 @@ export function ProjectsPage() {
     document.title = t('projects.documentTitle')
   }, [])
 
+  // Live updates: the gateway broadcasts projects.changed on every project
+  // CRUD (and on session moves) and sessions.changed on membership edits.
+  // Without these, a second client's rename/delete stays invisible until a
+  // manual Refresh. Unsubscribed on unmount (StrictMode-safe).
+  useEffect(() => {
+    const unsubProjects = rpc.on('projects.changed', () => {
+      void queryClient.invalidateQueries({ queryKey: ['projects'] })
+    })
+    const unsubSessions = rpc.on('sessions.changed', () => {
+      void queryClient.invalidateQueries({ queryKey: ['sessions'] })
+    })
+    return () => {
+      unsubProjects()
+      unsubSessions()
+    }
+  }, [rpc, queryClient])
+
   const projectsQuery = useQuery<RawProject[]>({
     queryKey: ['projects'],
     queryFn: async () => {
@@ -252,13 +270,22 @@ export function ProjectsPage() {
   const selected = projects.find((p) => projectIdOf(p) === selectedId) ?? null
   const selectedSessions = selected ? sessionsInProject(allSessions, selectedId) : []
 
-  // Drafts reset whenever the selected project (or its stored values) change.
   const selectedName = selected ? projectName(selected) : ''
   const selectedKnowledge = selected ? String(selected.knowledge ?? '') : ''
 
-  function selectProject(id: string) {
+  // Drafts reset whenever the selected project changes — keyed on the URL
+  // param, not on selectProject(), so browser back/forward (which changes
+  // ?project= without going through the click handler) cannot leak project
+  // A's draft into project B's editor. Adjusted during render (React's
+  // documented pattern) rather than in an effect.
+  const [draftProjectId, setDraftProjectId] = useState(selectedId)
+  if (draftProjectId !== selectedId) {
+    setDraftProjectId(selectedId)
     setNameDraft(null)
     setKnowledgeDraft(null)
+  }
+
+  function selectProject(id: string) {
     setSearchParams(id ? { project: id } : {}, { replace: false })
   }
 
@@ -285,21 +312,42 @@ export function ProjectsPage() {
 
   const updateMutation = useMutation({
     mutationFn: (vars: { id: string; name?: string; knowledge?: string }) =>
-      rpc.call('projects.update', {
+      rpc.call<{ project?: RawProject }>('projects.update', {
         projectId: vars.id,
         ...(vars.name !== undefined ? { name: vars.name } : {}),
         ...(vars.knowledge !== undefined ? { knowledge: vars.knowledge } : {}),
+        // Compare-and-swap: the gateway refuses the write (project.conflict)
+        // if the row changed since this client last read it, instead of
+        // silently clobbering another editor's save.
+        ...(selected
+          ? { expectedUpdatedAt: Number(selected.updated_at ?? selected.updatedAt) }
+          : {}),
       }),
-    onSuccess: (_data, vars) => {
+    onSuccess: (data, vars) => {
       toast.success(
         vars.knowledge !== undefined ? t('projects.knowledgeSaved') : t('projects.toastUpdated'),
         { id: 'projects-update' },
       )
+      // Patch the cached row from the response before clearing drafts, so
+      // the editor doesn't flash the stale pre-save value until the
+      // invalidated refetch lands.
+      const fresh = data?.project
+      if (fresh) {
+        queryClient.setQueryData<RawProject[]>(['projects'], (rows) =>
+          rows?.map((p) => (projectIdOf(p) === vars.id ? { ...p, ...fresh } : p)),
+        )
+      }
       setNameDraft(null)
       setKnowledgeDraft(null)
       invalidate()
     },
     onError: (err) => {
+      const code = (err as { code?: string }).code
+      if (code === 'project.conflict') {
+        toast.error(t('projects.toastUpdateConflict'), { id: 'projects-update-err' })
+        invalidate()
+        return
+      }
       const message = err instanceof Error ? err.message : String(err)
       toast.error(t('projects.toastUpdateFailed', { message }), { id: 'projects-update-err' })
     },
@@ -343,6 +391,8 @@ export function ProjectsPage() {
   })
 
   const hasProjects = projects.length > 0
+  const isLoading = projectsQuery.isLoading
+  const isError = projectsQuery.isError && !hasProjects
 
   return (
     <div className="proj-stage">
@@ -375,7 +425,28 @@ export function ProjectsPage() {
         </div>
       </header>
 
-      {!hasProjects ? (
+      {isLoading ? (
+        // Distinct from the empty state: a load in flight (or a failed load
+        // below) must not read as "no projects yet" with a create CTA.
+        <div className="proj-empty" aria-busy="true">
+          <RefreshCwIcon className="proj-empty__icon proj-refresh-spin" aria-hidden="true" />
+          <div className="proj-empty__title">{t('projects.loadingLabel')}</div>
+        </div>
+      ) : isError ? (
+        <div className="proj-empty" role="alert">
+          <FolderKanbanIcon className="proj-empty__icon" aria-hidden="true" />
+          <div className="proj-empty__title">{t('projects.errorTitle')}</div>
+          <p className="proj-empty__msg">
+            {projectsQuery.error instanceof Error
+              ? projectsQuery.error.message
+              : String(projectsQuery.error)}
+          </p>
+          <Button onClick={invalidate}>
+            <RefreshCwIcon />
+            <span>{t('projects.errorRetry')}</span>
+          </Button>
+        </div>
+      ) : !hasProjects ? (
         <div className="proj-empty">
           <FolderKanbanIcon className="proj-empty__icon" aria-hidden="true" />
           <div className="proj-empty__title">{t('projects.emptyTitle')}</div>
@@ -448,11 +519,13 @@ export function ProjectsPage() {
                       </Button>
                     </div>
                   </label>
-                  <span className="proj-detail__meta proj-dim t-data">
-                    {t('projects.updatedAt', {
-                      time: relTimeLabel(Number(selected.updated_at ?? selected.updatedAt ?? 0)),
-                    })}
-                  </span>
+                  {selected.updated_at != null || selected.updatedAt != null ? (
+                    <span className="proj-detail__meta proj-dim t-data">
+                      {t('projects.updatedAt', {
+                        time: relTimeLabel(Number(selected.updated_at ?? selected.updatedAt)),
+                      })}
+                    </span>
+                  ) : null}
                 </div>
 
                 <label className="proj-field">
@@ -465,9 +538,20 @@ export function ProjectsPage() {
                     placeholder={t('projects.knowledgePlaceholder')}
                     onChange={(e) => setKnowledgeDraft(e.target.value)}
                   />
-                  <small className="proj-field__hint">{t('projects.knowledgeHint')}</small>
+                  <small className="proj-field__hint">
+                    {t('projects.knowledgeHint')}{' '}
+                    <span className="t-data">
+                      {t('projects.knowledgeCounter', {
+                        count: (knowledgeDraft ?? selectedKnowledge).length,
+                        max: PROJECT_KNOWLEDGE_MAX,
+                      })}
+                    </span>
+                  </small>
                 </label>
                 <div className="proj-knowledge-actions">
+                  {knowledgeDraft !== null && knowledgeDraft !== selectedKnowledge ? (
+                    <span className="proj-dim t-data">{t('projects.unsavedChanges')}</span>
+                  ) : null}
                   <Button
                     size="sm"
                     disabled={

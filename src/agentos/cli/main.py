@@ -219,9 +219,139 @@ def memory_index_cmd(
     )
 
 
+curated_app = typer.Typer(help="Curated memory commands (MEMORY.md / USER.md).")
+memory_app.add_typer(curated_app, name="curated")
+
+
+@curated_app.command("get")
+def memory_curated_get_cmd(
+    target: str = typer.Option("memory", "--target", "-t", help="Target: memory or user"),
+    agent_id: str = typer.Option("main", "--agent", help="Agent id (default: main)"),
+    json_output: bool = typer.Option(False, "--json", help="Emit machine-readable JSON"),
+) -> None:
+    """Get curated memory entries and usage."""
+
+    from agentos.cli.gateway_rpc import run_gateway_sync
+    from agentos.cli.output import print_json
+    from agentos.cli.ui import console
+
+    async def _run(client):
+        return await client.call("memory.curated.get", {"agentId": agent_id, "target": target})
+
+    payload = run_gateway_sync(_run, json_output=json_output)
+    if json_output:
+        print_json(payload)
+        return
+
+    console.print(f"[bold]{target.upper()}.md[/bold] ({payload.get('usage', '')})")
+    for i, entry in enumerate(payload.get("entries", []), 1):
+        console.print(f"  {i}. {entry}")
+
+
+@curated_app.command("add")
+def memory_curated_add_cmd(
+    content: str = typer.Argument(..., help="Content to add to curated memory"),
+    target: str = typer.Option("memory", "--target", "-t", help="Target: memory or user"),
+    agent_id: str = typer.Option("main", "--agent", help="Agent id (default: main)"),
+    json_output: bool = typer.Option(False, "--json", help="Emit machine-readable JSON"),
+) -> None:
+    """Add an entry to curated memory."""
+
+    from agentos.cli.gateway_rpc import run_gateway_sync
+    from agentos.cli.output import print_json
+    from agentos.cli.ui import console
+
+    async def _run(client):
+        return await client.call(
+            "memory.curated.add", {"agentId": agent_id, "target": target, "content": content}
+        )
+
+    payload = run_gateway_sync(_run, json_output=json_output)
+    if json_output:
+        print_json(payload)
+        return
+    console.print(f"[green]{payload.get('message', 'Entry added.')}[/green]")
+
+
+@curated_app.command("remove")
+def memory_curated_remove_cmd(
+    old_text: str = typer.Argument(..., help="Text of the entry to remove"),
+    target: str = typer.Option("memory", "--target", "-t", help="Target: memory or user"),
+    agent_id: str = typer.Option("main", "--agent", help="Agent id (default: main)"),
+    json_output: bool = typer.Option(False, "--json", help="Emit machine-readable JSON"),
+) -> None:
+    """Remove an entry from curated memory."""
+
+    from agentos.cli.gateway_rpc import run_gateway_sync
+    from agentos.cli.output import print_json
+    from agentos.cli.ui import console
+
+    async def _run(client):
+        return await client.call(
+            "memory.curated.remove", {"agentId": agent_id, "target": target, "oldText": old_text}
+        )
+
+    payload = run_gateway_sync(_run, json_output=json_output)
+    if json_output:
+        print_json(payload)
+        return
+    console.print(f"[green]{payload.get('message', 'Entry removed.')}[/green]")
+
+
+@memory_app.command("ingest")
+def memory_ingest_cmd(
+    path: str = typer.Argument(
+        ..., help="Path to a document file or folder to ingest into knowledge base"
+    ),
+    agent_id: str = typer.Option("main", "--agent", help="Agent id (default: main)"),
+    recursive: bool = typer.Option(
+        True, "--recursive/--no-recursive", help="Recursively ingest directories"
+    ),
+    json_output: bool = typer.Option(False, "--json", help="Emit machine-readable JSON"),
+) -> None:
+    """Ingest a document file or folder into the agent's knowledge base."""
+
+    from rich.table import Table
+
+    from agentos.cli.gateway_rpc import run_gateway_sync
+    from agentos.cli.output import print_json
+    from agentos.cli.ui import console
+
+    async def _run(client):
+        return await client.call(
+            "memory.knowledge_base.ingest",
+            {"path": path, "agentId": agent_id, "recursive": recursive},
+        )
+
+    payload = run_gateway_sync(_run, json_output=json_output)
+    if json_output:
+        print_json(payload)
+        return
+
+    results = payload.get("results", [])
+    table = Table(title=f"Ingested documents — agent={agent_id}", show_header=True)
+    table.add_column("Path")
+    table.add_column("Chunks", justify="right")
+    table.add_column("Size bytes", justify="right")
+    table.add_column("Status")
+    table.add_column("Error")
+    for r in results:
+        table.add_row(
+            str(r.get("path") or ""),
+            str(r.get("chunksIndexed") or 0),
+            str(r.get("sizeBytes") or 0),
+            str(r.get("status") or ""),
+            str(r.get("error") or ""),
+        )
+    console.print(table)
+
+
 @memory_app.command("list")
 def memory_list_cmd(
     agent_id: str = typer.Option("main", "--agent", help="Agent id (default: main)"),
+    source: str | None = typer.Option(
+        None, "--source", help="Filter source: memory, knowledge_base, sessions, or all"
+    ),
     json_output: bool = typer.Option(False, "--json", help="Emit machine-readable JSON"),
 ) -> None:
     """List durable memory source files from the running gateway."""
@@ -233,7 +363,10 @@ def memory_list_cmd(
     from agentos.cli.ui import console
 
     async def _run(client):
-        return await client.call("memory.list", {"agentId": agent_id})
+        params: dict[str, object] = {"agentId": agent_id}
+        if source:
+            params["source"] = source
+        return await client.call("memory.list", params)
 
     payload = run_gateway_sync(_run, json_output=json_output)
     if json_output:
@@ -242,12 +375,14 @@ def memory_list_cmd(
 
     table = Table(title=f"Memory sources - agent={agent_id}", show_header=True)
     table.add_column("Path")
+    table.add_column("Source")
     table.add_column("Lines", justify="right")
     table.add_column("Size bytes", justify="right")
     table.add_column("Modified")
     for row in payload.get("files", []):
         table.add_row(
             str(row.get("path") or ""),
+            str(row.get("source") or "memory"),
             "" if row.get("lineCount") is None else str(row.get("lineCount")),
             "" if row.get("sizeBytes") is None else str(row.get("sizeBytes")),
             str(row.get("modifiedAt") or ""),
@@ -263,7 +398,7 @@ def memory_search_cmd(
     source: str = typer.Option(
         "memory",
         "--source",
-        help="Search source: memory, sessions, or all",
+        help="Search source: memory, knowledge_base, sessions, or all",
     ),
     json_output: bool = typer.Option(False, "--json", help="Emit machine-readable JSON"),
 ) -> None:

@@ -8,6 +8,7 @@ import { useRpc } from '@/app/providers'
 import { useApprovals } from '@/services/approval-monitor'
 import { useTheme } from '@/stores/theme'
 import { chatMarkdown } from './markdown'
+import { createCardsMounter, type CardsMounter } from './transcript/cards'
 import { createChartMounter, type ChartMounter } from './transcript/chart'
 import {
   createStreamController,
@@ -465,9 +466,23 @@ export function useTranscript(opts: {
       getTheme: () => useTheme.getState().mode,
     }),
   )
+  // Card-grid artifacts (cards.ts). Plain DOM, so unlike charts there is no
+  // canvas or library handle to dispose and no theme callback — the mounter only
+  // tracks which placeholders it has already filled.
+  const [cardsMounter] = useState<CardsMounter>(() =>
+    createCardsMounter({ fetchPayload: fetchChartPayload }),
+  )
+
+  // One seam for both inline-artifact renderers. The downstream deps (stream.ts,
+  // history.ts, artifacts.ts) call this whenever new rows land; keeping a single
+  // callback means a new inline artifact type is composed here rather than
+  // threaded through every one of them.
   const mountCharts = useCallback(
-    (container: HTMLElement) => chartMounter.mountCharts(container),
-    [chartMounter],
+    (container: HTMLElement) => {
+      chartMounter.mountCharts(container)
+      cardsMounter.mountCards(container)
+    },
+    [chartMounter, cardsMounter],
   )
 
   useEffect(() => {
@@ -475,8 +490,9 @@ export function useTranscript(opts: {
     return () => {
       unsubscribe()
       chartMounter.destroyAll()
+      cardsMounter.destroyAll()
     }
-  }, [chartMounter])
+  }, [chartMounter, cardsMounter])
 
   // eslint-disable-next-line react-hooks/refs -- factory stores the refs and reads .current only later, inside methods invoked outside render (never at creation)
   const [controller] = useState<StreamController>(() =>

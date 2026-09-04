@@ -63,7 +63,7 @@ function wireRpc(
   opts: {
     projects?: unknown[]
     createReject?: boolean
-    updateReject?: boolean
+    updateReject?: boolean | 'conflict'
   } = {},
 ) {
   mockRpc.call.mockImplementation((method: string) => {
@@ -79,6 +79,11 @@ function wireRpc(
           ? Promise.reject(new Error('create failed'))
           : Promise.resolve({ project: { project_id: 'proj-new', name: 'New one' } })
       case 'projects.update':
+        if (opts.updateReject === 'conflict') {
+          const err = new Error('changed since it was read') as Error & { code?: string }
+          err.code = 'project.conflict'
+          return Promise.reject(err)
+        }
         return opts.updateReject
           ? Promise.reject(new Error('update failed'))
           : Promise.resolve({ project: {} })
@@ -168,8 +173,44 @@ describe('ProjectsPage', () => {
       expect(mockRpc.call).toHaveBeenCalledWith('projects.update', {
         projectId: 'proj-1',
         knowledge: 'Updated knowledge',
+        expectedUpdatedAt: 300,
       }),
     )
+  })
+
+  it('subscribes to projects.changed and sessions.changed for live updates', async () => {
+    wireRpc()
+    renderPage()
+    await screen.findByText('Token research')
+    const events = (mockRpc.on.mock.calls as unknown[][]).map((c) => c[0])
+    expect(events).toContain('projects.changed')
+    expect(events).toContain('sessions.changed')
+  })
+
+  it('shows a conflict toast and keeps the draft when the save loses the CAS', async () => {
+    wireRpc({ updateReject: 'conflict' })
+    renderPage('/projects?project=proj-1')
+    const textarea = await screen.findByDisplayValue('Solana pools context.')
+    fireEvent.change(textarea, { target: { value: 'Mine' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Save knowledge' }))
+    await waitFor(() =>
+      expect(toast.error).toHaveBeenCalledWith(
+        expect.stringContaining('changed elsewhere'),
+        expect.anything(),
+      ),
+    )
+    // The user's draft survives the conflict for re-apply.
+    expect(screen.getByDisplayValue('Mine')).toBeTruthy()
+  })
+
+  it('shows the load error state instead of the empty state', async () => {
+    mockRpc.call.mockImplementation((method: string) =>
+      method === 'projects.list' ? Promise.reject(new Error('gateway down')) : Promise.resolve({}),
+    )
+    renderPage()
+    await screen.findByText('Projects failed to load')
+    expect(screen.queryByText('No projects yet')).toBeNull()
+    expect(screen.getByRole('button', { name: /Retry/i })).toBeTruthy()
   })
 
   it('starts a new chat in the project and navigates to it', async () => {

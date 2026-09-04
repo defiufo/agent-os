@@ -22,10 +22,13 @@ from typing import Any
 # Allowed values
 # ---------------------------------------------------------------------------
 
+#: Adapters this build ships and advertises. ``email`` is an open protocol
+#: rather than a vendor SaaS, but it carries the same shared contract.
 PUBLIC_VENDOR_ADAPTERS: tuple[str, ...] = (
     "slack",
     "discord",
     "telegram",
+    "email",
 )
 
 #: Capability tier values declared by adapters via ``CAPABILITY_TIER``.

@@ -10,7 +10,7 @@ from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, cast
+from typing import Any, ClassVar, cast
 
 import httpx
 import structlog
@@ -29,6 +29,7 @@ from agentos.channels._util import (
     EventDedupeCache,
     RateLimiter,
     StreamThrottle,
+    check_channel_file_size,
     retry_request,
 )
 from agentos.channels.contract import (
@@ -143,6 +144,10 @@ class DiscordChannel:
     _dispatch_task: asyncio.Task[None] | None = field(default=None, init=False, repr=False)
     _reconnect_lock: asyncio.Lock = field(default_factory=asyncio.Lock, init=False, repr=False)
     _reconnecting: bool = field(default=False, init=False, repr=False)
+    # Bumped at the end of each successful _do_reconnect. Concurrent callers
+    # snapshot this before taking the lock so a second waiter does not IDENTIFY
+    # again on a socket the first waiter already replaced.
+    _reconnect_generation: int = field(default=0, init=False, repr=False)
     _dedupe: EventDedupeCache = field(
         default_factory=lambda: EventDedupeCache(max_size=10_000),
         init=False,
@@ -282,25 +287,30 @@ class DiscordChannel:
     async def _reconnect(self) -> None:
         """Re-establish the gateway connection.
 
-        Idempotent under concurrent calls: a second invocation while a
-        first is in flight is a no-op. Without this guard a heartbeat
-        timeout racing an op-7 / op-9 in the dispatch loop could trigger
-        two simultaneous IDENTIFY sequences and leave two heartbeat tasks
-        running against the same socket.
+        Concurrent callers wait for the in-flight reconnect rather than
+        no-op returning: the dispatch loop keeps receiving after a
+        reconnect and must not race past a still-closed socket. A second
+        waiter that arrived after the socket was already replaced skips
+        a duplicate IDENTIFY.
         """
-        if self._reconnecting:
-            log.info("discord.reconnect_skipped_already_in_flight")
-            return
+        generation = self._reconnect_generation
         async with self._reconnect_lock:
+            if not self._connected:
+                return
+            if generation != self._reconnect_generation:
+                log.info("discord.reconnect_skipped_already_in_flight")
+                return
             self._reconnecting = True
             try:
                 await self._do_reconnect()
+                self._reconnect_generation += 1
             finally:
                 self._reconnecting = False
 
     async def _do_reconnect(self) -> None:
         log.info("discord.reconnecting", session_id=self._state.session_id)
-        if self._heartbeat_task is not None:
+        current = asyncio.current_task()
+        if self._heartbeat_task is not None and self._heartbeat_task is not current:
             self._heartbeat_task.cancel()
             self._heartbeat_task = None
         await self._close_ws()
@@ -342,6 +352,7 @@ class DiscordChannel:
             ):
                 if self._connected:
                     await self._reconnect()
+                    continue
                 return
 
             op = raw.get("op")
@@ -354,7 +365,7 @@ class DiscordChannel:
                 await self._ws_send({"op": 1, "d": self._state.sequence})
             elif op == 7:  # Reconnect
                 await self._reconnect()
-                return
+                continue
             elif op == 9:  # Invalid Session
                 resumable = raw.get("d", False)
                 if not resumable:
@@ -362,7 +373,7 @@ class DiscordChannel:
                     self._state.sequence = None
                 await asyncio.sleep(1 + random.random() * 4)
                 await self._reconnect()
-                return
+                continue
             elif op == 11:  # Heartbeat ACK
                 self._state.last_heartbeat_ack = True
 
@@ -1007,12 +1018,15 @@ class DiscordChannel:
             provider_message_id=str(data.get("id", "")),
         )
 
+    MAX_FILE_BYTES: ClassVar[int] = 10 * 1024 * 1024
+
     async def send_file(
         self,
         channel_id: str,
         file_path: str,
         content: str = "",
     ) -> ChannelSendResult:
+        check_channel_file_size(file_path, self.MAX_FILE_BYTES, "Discord")
         await self._rate_limiter.acquire()
         client = self._get_client()
         with open(file_path, "rb") as f:

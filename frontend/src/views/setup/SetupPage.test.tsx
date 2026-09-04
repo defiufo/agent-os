@@ -532,6 +532,94 @@ describe('SetupPage', () => {
     expect(polls).toBeGreaterThanOrEqual(2)
   })
 
+  it('xai sign-in cancel abandons the in-flight poll so an expiry does not paint an error', async () => {
+    // Cancel used to only reset the visible phase — the poll loop kept running,
+    // so a later server-side expiry painted an error on the idle card the
+    // operator had already dismissed.
+    let resolvePoll: ((value: { status: string }) => void) | undefined
+    mockRpc.call.mockImplementation((method: string) => {
+      if (method === 'onboarding.catalog') return Promise.resolve(CATALOG)
+      if (method === 'onboarding.status') return Promise.resolve(statusFor())
+      if (method === 'config.get') return Promise.resolve(CONFIG)
+      if (method === 'auth.status')
+        return Promise.resolve({ xai: { logged_in: false, has_refresh_token: false } })
+      if (method === 'auth.xai.login.start')
+        return Promise.resolve({
+          loginId: 'login-1',
+          verificationUri: 'https://accounts.x.ai/oauth2/device?code=ABCD',
+          userCode: 'ABCD-EFGH',
+          interval: 0,
+        })
+      if (method === 'auth.xai.login.poll')
+        return new Promise((resolve) => {
+          resolvePoll = resolve
+        })
+      return Promise.resolve({})
+    })
+    renderPage()
+    await waitFor(() => expect(screen.getByText('Setup')).toBeInTheDocument())
+    fireEvent.click(screen.getByRole('button', { name: /^Capabilities:/ }))
+    fireEvent.click(await screen.findByRole('button', { name: 'Sign in with xAI' }))
+    expect(await screen.findByText('ABCD-EFGH')).toBeInTheDocument()
+    await waitFor(() => expect(resolvePoll).toBeDefined())
+
+    fireEvent.click(screen.getByRole('button', { name: 'Cancel sign-in' }))
+    expect(screen.getByRole('button', { name: 'Sign in with xAI' })).toBeInTheDocument()
+    expect(screen.queryByText('ABCD-EFGH')).not.toBeInTheDocument()
+
+    resolvePoll!({ status: 'expired' })
+    await new Promise((resolve) => window.setTimeout(resolve, 50))
+    expect(screen.queryByText(/The sign-in code expired/)).not.toBeInTheDocument()
+    expect(screen.queryByText(/Sign-in failed:/)).not.toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Sign in with xAI' })).toBeInTheDocument()
+  })
+
+  it('xai sign-in cancel then restart is not clobbered by the abandoned poll', async () => {
+    // A restarted sign-in used to race the old loop's completion, which wiped
+    // the fresh awaiting UI (code + approval link) mid-login.
+    const polls: Array<(value: { status: string }) => void> = []
+    let starts = 0
+    mockRpc.call.mockImplementation((method: string) => {
+      if (method === 'onboarding.catalog') return Promise.resolve(CATALOG)
+      if (method === 'onboarding.status') return Promise.resolve(statusFor())
+      if (method === 'config.get') return Promise.resolve(CONFIG)
+      if (method === 'auth.status')
+        return Promise.resolve({ xai: { logged_in: false, has_refresh_token: false } })
+      if (method === 'auth.xai.login.start') {
+        starts += 1
+        return Promise.resolve({
+          loginId: `login-${starts}`,
+          verificationUri: `https://accounts.x.ai/oauth2/device?code=${starts}`,
+          userCode: starts === 1 ? 'AAAA-AAAA' : 'BBBB-BBBB',
+          interval: 0,
+        })
+      }
+      if (method === 'auth.xai.login.poll')
+        return new Promise((resolve) => {
+          polls.push(resolve)
+        })
+      return Promise.resolve({})
+    })
+    renderPage()
+    await waitFor(() => expect(screen.getByText('Setup')).toBeInTheDocument())
+    fireEvent.click(screen.getByRole('button', { name: /^Capabilities:/ }))
+    fireEvent.click(await screen.findByRole('button', { name: 'Sign in with xAI' }))
+    expect(await screen.findByText('AAAA-AAAA')).toBeInTheDocument()
+    await waitFor(() => expect(polls.length).toBe(1))
+
+    fireEvent.click(screen.getByRole('button', { name: 'Cancel sign-in' }))
+    fireEvent.click(await screen.findByRole('button', { name: 'Sign in with xAI' }))
+    expect(await screen.findByText('BBBB-BBBB')).toBeInTheDocument()
+    await waitFor(() => expect(polls.length).toBe(2))
+
+    polls[0]!({ status: 'complete' })
+    await new Promise((resolve) => window.setTimeout(resolve, 50))
+    expect(screen.getByText('BBBB-BBBB')).toBeInTheDocument()
+    expect(screen.queryByText('AAAA-AAAA')).not.toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Cancel sign-in' })).toBeInTheDocument()
+    expect(vi.mocked(toast.info)).not.toHaveBeenCalled()
+  })
+
   it('xai sign-in surfaces a start failure instead of hanging on a spinner', async () => {
     mockRpc.call.mockImplementation((method: string) => {
       if (method === 'onboarding.catalog') return Promise.resolve(CATALOG)

@@ -82,8 +82,20 @@ async def test_knowledge_edit_is_picked_up_next_turn(runner, manager):
 
 @pytest.mark.asyncio
 async def test_oversized_knowledge_is_truncated_with_marker(runner, manager):
+    """Rows written under the old 32k cap (or edited out-of-band) still get
+    truncated at injection; writes above the cap are rejected up front now,
+    so the legacy row is planted directly in storage."""
+    from agentos.session.models import ProjectNode
+
     cap = TurnRunner.PROJECT_KNOWLEDGE_INJECT_MAX_CHARS
-    project = await manager.create_project("main", "Research", knowledge="x" * 30_000)
+    project = await manager.create_project("main", "Research", knowledge="v1")
+    legacy = ProjectNode(
+        project_id=project["project_id"],
+        agent_id="main",
+        name="Research",
+        knowledge="x" * 30_000,
+    )
+    await manager._storage.upsert_project(legacy)
     await manager.create(SESSION_KEY, agent_id="main", project_id=project["project_id"])
 
     merged = await runner._augment_extra_context_with_project_knowledge(

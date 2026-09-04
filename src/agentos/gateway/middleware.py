@@ -14,7 +14,8 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse, PlainTextResponse, Response
 from starlette.types import ASGIApp
 
-from agentos.gateway.access import is_loopback_address
+from agentos.gateway.access import is_loopback_address, peer_is_trusted_proxy
+from agentos.gateway.auth import token_matches
 from agentos.gateway.config import GatewayConfig
 
 log = structlog.get_logger(__name__)
@@ -33,6 +34,11 @@ _API_PREFIX = "/api"
 # Everything else under ``{base_path}/api/`` is Control surface and is treated
 # like the root ``/api/*`` routes.
 _UI_BOOTSTRAP_SUFFIX = f"{_API_PREFIX}/bootstrap"
+
+# The approval queue the Control UI polls. Rate-limited in its own per-IP
+# bucket (see ``RateLimitMiddleware._bucket_for``) rather than shared with the
+# rest of ``/api/*``.
+_APPROVALS_PATH = f"{_API_PREFIX}/approvals"
 
 
 def _is_under(prefix: str, path: str) -> bool:
@@ -243,19 +249,30 @@ class AuthMiddleware(BaseHTTPMiddleware):
 
         if auth_mode == "token":
             token = self._extract_token(request)
-            configured_token = self._config.auth.token
-            if not configured_token or token != configured_token:
+            if not token_matches(token, self._config.auth.token):
                 return JSONResponse(
                     {"error": "Unauthorized", "code": "UNAUTHORIZED"}, status_code=401
                 )
 
         elif auth_mode == "trusted-proxy":
-            proxy = self._config.auth.trusted_proxy
-            forwarded_for = request.headers.get("x-forwarded-for", "")
-            if proxy and proxy not in forwarded_for:
+            # A trusted-proxy deployment means a reverse proxy in front of the
+            # gateway terminates TLS and sets X-Forwarded-For. Admission must
+            # require that the *real transport peer* is one of the trusted
+            # proxies — NOT that some client-supplied header merely *contains*
+            # the proxy name. The old check (``proxy not in forwarded_for``) was
+            # a substring match: any client could send ``X-Forwarded-For: <proxy>``
+            # and pass.
+            peer_ip = request.client.host if request.client else None
+            if not self._is_trusted_proxy(peer_ip):
                 return JSONResponse(
                     {"error": "Unauthorized", "code": "UNAUTHORIZED"}, status_code=401
                 )
+            # Peer IS a trusted proxy — X-Forwarded-For is exactly what
+            # trusted-proxy mode exists to consume (nginx / Caddy / ALB all
+            # set it on every forwarded request). The same ``_is_trusted_proxy``
+            # check gates downstream consumption of the header in
+            # ``RateLimitMiddleware._get_client_ip``, so a spoofed XFF from a
+            # non-trusted peer can never be honored.
 
         else:
             # Fail closed on any mode without an enforcement branch above
@@ -270,6 +287,9 @@ class AuthMiddleware(BaseHTTPMiddleware):
 
         return await call_next(request)  # type: ignore[no-any-return]
 
+    def _is_trusted_proxy(self, peer_ip: str | None) -> bool:
+        return peer_is_trusted_proxy(self._config.auth.trusted_proxy, peer_ip)
+
     def _extract_token(self, request: Request) -> str | None:
         auth_header = request.headers.get("authorization", "")
         if auth_header.startswith("Bearer "):
@@ -278,7 +298,15 @@ class AuthMiddleware(BaseHTTPMiddleware):
 
 
 class RateLimitMiddleware(BaseHTTPMiddleware):
-    """Simple sliding-window rate limiter per client IP."""
+    """Simple sliding-window rate limiter per client IP.
+
+    Requests are counted in named buckets. Everything shares the ``"api"``
+    bucket except ``GET /api/approvals``, which gets its own ``"approvals"``
+    bucket with a higher cap (``rate_limit.approvals_max_requests``) so the
+    Control UI's 1.5s poll cannot exhaust the budget the rest of the API
+    depends on — and so that poll cannot be used to enumerate pending tool
+    calls without limit either.
+    """
 
     def __init__(
         self,
@@ -293,25 +321,24 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
             config.control_ui.base_path if control_ui_base_path is None else control_ui_base_path
         )
         self._ui_prefix = _safe_ui_exempt_prefix(base_path)
-        # {ip: [timestamp, ...]} with LRU eviction ordering
-        self._windows: OrderedDict[str, list[float]] = OrderedDict()
+        # {(bucket, ip): [timestamp, ...]} with LRU eviction ordering. An IP
+        # that both polls approvals and calls the rest of the API therefore
+        # holds two entries; ``max_tracked_clients`` bounds entries, not IPs.
+        self._windows: OrderedDict[tuple[str, str], list[float]] = OrderedDict()
         self._max_tracked_clients = max_tracked_clients
         self._last_sweep: float = 0.0
 
     def _is_ui_path(self, path: str) -> bool:
         if self._ui_prefix is None:
             return False
-        return _is_under(self._ui_prefix, path)
+        if not _is_under(self._ui_prefix, path):
+            return False
+        if path == self._ui_prefix + _UI_BOOTSTRAP_SUFFIX:
+            return True
+        return not _is_under(self._ui_prefix + _API_PREFIX, path)
 
     def _is_trusted_proxy(self, peer_ip: str | None) -> bool:
-        if not peer_ip:
-            return False
-        trusted = self._config.auth.trusted_proxy
-        if not trusted:
-            return False
-        trusted_set = {p.strip().lower().strip("[]") for p in trusted.split(",") if p.strip()}
-        peer = peer_ip.strip().lower().strip("[]")
-        return peer in trusted_set
+        return peer_is_trusted_proxy(self._config.auth.trusted_proxy, peer_ip)
 
     def _get_client_ip(self, request: Request) -> str:
         peer_ip = request.client.host if request.client else None
@@ -328,17 +355,32 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
     def _sweep_expired(self, now: float, window: float) -> None:
         self._last_sweep = now
         expired = [
-            ip
-            for ip, timestamps in self._windows.items()
+            key
+            for key, timestamps in self._windows.items()
             if not timestamps or (now - timestamps[-1] >= window)
         ]
-        for ip in expired:
-            self._windows.pop(ip, None)
+        for key in expired:
+            self._windows.pop(key, None)
 
     def _evict_excess(self, now: float, window: float) -> None:
         self._sweep_expired(now, window)
         while len(self._windows) > self._max_tracked_clients:
             self._windows.popitem(last=False)
+
+    def _bucket_for(self, request: Request, path: str) -> tuple[str, int]:
+        """Return the ``(bucket name, max requests)`` this request counts against.
+
+        Only the polled approvals read gets the dedicated bucket. ``HEAD`` is
+        included because Starlette serves it from the same ``methods=["GET"]``
+        route, so a HEAD runs the handler — and therefore the SQLite read — in
+        full; charging it elsewhere would leave the handler reachable
+        ``max_requests`` extra times per window on top of the advertised cap.
+        The mutating approval routes (``/api/approvals/resolve``,
+        ``/api/approvals/settings``) are not polled and stay on the shared cap.
+        """
+        if request.method in ("GET", "HEAD") and path == _APPROVALS_PATH:
+            return "approvals", self._config.rate_limit.approvals_max_requests
+        return "api", self._config.rate_limit.max_requests
 
     async def dispatch(self, request: Request, call_next: Callable) -> Response:
         if not self._config.rate_limit.enabled:
@@ -352,13 +394,12 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
         path = request.url.path
         if self._is_ui_path(path):
             return await call_next(request)  # type: ignore[no-any-return]
-        if request.method == "GET" and path == "/api/approvals":
-            return await call_next(request)  # type: ignore[no-any-return]
 
+        bucket, max_req = self._bucket_for(request, path)
         client_ip = self._get_client_ip(request)
+        key = (bucket, client_ip)
         now = time.time()
         window = float(self._config.rate_limit.window_seconds)
-        max_req = self._config.rate_limit.max_requests
         sweep_interval = min(window, 60.0)
 
         # Periodic sweep of expired windows
@@ -366,18 +407,18 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
             self._sweep_expired(now, window)
 
         # Prune old timestamps
-        timestamps = [t for t in self._windows.get(client_ip, []) if now - t < window]
+        timestamps = [t for t in self._windows.get(key, []) if now - t < window]
 
         if len(timestamps) >= max_req:
-            self._windows[client_ip] = timestamps
-            self._windows.move_to_end(client_ip)
+            self._windows[key] = timestamps
+            self._windows.move_to_end(key)
             return JSONResponse(
                 {"error": "Too Many Requests", "code": "RATE_LIMITED"}, status_code=429
             )
 
         timestamps.append(now)
-        self._windows[client_ip] = timestamps
-        self._windows.move_to_end(client_ip)
+        self._windows[key] = timestamps
+        self._windows.move_to_end(key)
 
         if len(self._windows) > self._max_tracked_clients:
             self._evict_excess(now, window)

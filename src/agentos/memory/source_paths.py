@@ -34,6 +34,18 @@ def is_session_source_path(path: str) -> bool:
     )
 
 
+def is_knowledge_base_source_path(path: str) -> bool:
+    """Return True for ingested knowledge base source documents."""
+    if path.startswith(("/", "\\")):
+        return False
+    rel = Path(path)
+    if rel.is_absolute() or any(part in {"", ".", ".."} for part in rel.parts):
+        return False
+    if any(part.startswith(".") for part in rel.parts):
+        return False
+    return True
+
+
 def is_searchable_source_path(source: MemorySource | str, path: str) -> bool:
     """Return True when an indexed result belongs to a searchable source."""
     try:
@@ -44,4 +56,6 @@ def is_searchable_source_path(source: MemorySource | str, path: str) -> bool:
         return is_memory_source_path(path)
     if memory_source is MemorySource.sessions:
         return is_session_source_path(path)
+    if memory_source is MemorySource.knowledge_base:
+        return is_knowledge_base_source_path(path)
     return False

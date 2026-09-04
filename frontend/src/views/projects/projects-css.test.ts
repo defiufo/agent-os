@@ -13,6 +13,17 @@ describe('Projects view CSS contract', () => {
     )
   })
 
+  it('stacks the page header above full-width actions on mobile', () => {
+    // Matches the overview header: side-by-side on mobile squeezes the
+    // subtitle into a narrow column with the buttons overlapping it.
+    expect(css).toMatch(
+      /@media \(max-width: 700px\)[\s\S]*?\.proj-stage__header \{[\s\S]*?flex-direction: column;/,
+    )
+    expect(css).toMatch(
+      /@media \(max-width: 700px\)[\s\S]*?\.proj-stage__actions \{[\s\S]*?width: 100%;/,
+    )
+  })
+
   it('keeps the knowledge editor vertically resizable with a minimum height', () => {
     expect(css).toMatch(
       /\.proj-knowledge-input \{[\s\S]*?resize: vertical;[\s\S]*?min-height: 6rem;/,

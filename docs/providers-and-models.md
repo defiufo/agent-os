@@ -41,6 +41,9 @@ agentos configure provider --provider openrouter --api-key-env OPENROUTER_API_KE
 
 export OPENCAP_API_KEY="ocap_..."
 agentos configure provider --provider opencap --api-key-env OPENCAP_API_KEY
+
+export SURPLUS_API_KEY="inf_..."
+agentos configure provider --provider surplus --api-key-env SURPLUS_API_KEY
 ```
 
 When testing OpenCAP from a source checkout, prefix both configuration and
@@ -67,6 +70,7 @@ This build exposes onboarding support for:
 - OpenRouter (default provider)
 - Bankr LLM Gateway
 - OpenCAP
+- Surplus Intelligence
 - OpenAI
 - Anthropic
 - Ollama
@@ -88,7 +92,19 @@ OpenCAP defaults to `https://gw.capminal.ai/api/inference/v1` and uses one
 OpenAI-compatible key for inference. Its public model catalog is unauthenticated.
 The default direct/fallback model is the balanced `c1` model, `gpt-5.6-luna`. The `recommended`
 router profile selects bare OpenCAP model IDs across
-[`c0`–`c3`](features/agentos-router.md#model-tiers) and the vision route.
+[`c0`–`c3`](features/agentos-router.md#model-tiers) and the vision route:
+
+| Tier | Model | Role |
+| --- | --- | --- |
+| `c0` | `deepseek-v4-flash` | trivial chat, short rewrites, extraction |
+| `c1` | `gpt-5.6-luna` | default balanced route for normal agent work |
+| `c2` | `glm-5.3` | multi-step coding, structured reasoning, larger synthesis |
+| `c3` | `claude-opus-5` | difficult planning, deep review, high-stakes synthesis |
+| `image_model` | `minimax-m3` | image attachments, screenshots, diagrams |
+
+These are OpenCAP's own defaults, not a copy of the Bankr profile — the two
+gateways publish overlapping but different catalogs. Run `agentos models list`
+against a configured OpenCAP key to see everything the gateway currently serves.
 
 At gateway boot, AgentOS fetches the public catalog asynchronously for model
 choices, capabilities, and provider-scoped cost estimates. If that fetch fails,
@@ -100,11 +116,56 @@ upstream provider ID advertised by the current live catalog:
 
 ```toml
 [llm.provider_routing]
-"glm-5.2" = "provider-id-from-live-catalog"
+"glm-5.3" = "provider-id-from-live-catalog"
 ```
 
 AgentOS sends this as OpenCAP's provider allow-list. OpenRouter uses the same
 configuration table but retains its existing preferred-order payload.
+
+### Surplus Intelligence routing
+
+[Surplus Intelligence](https://www.surplusintelligence.ai/) is a two-sided
+marketplace for inference: sellers list endpoints, buyers get routed to the
+cheapest healthy one, and settlement happens in USDC on Base. AgentOS talks to
+it as an ordinary OpenAI-compatible provider using a buyer API key (`inf_...`),
+so no wallet or on-chain payment support is required.
+
+It defaults to `https://api.surplusintelligence.ai/v1`. Its model catalog is
+public and unauthenticated. The default direct/fallback model is the balanced
+`c1` model, `gpt-5.6-luna`. The `recommended` router profile selects bare
+Surplus model IDs across
+[`c0`–`c3`](features/agentos-router.md#model-tiers) and the vision route:
+
+| Tier | Model | Role |
+| --- | --- | --- |
+| `c0` | `deepseek-v4-flash` | trivial chat, short rewrites, extraction |
+| `c1` | `gpt-5.6-luna` | default balanced route for normal agent work |
+| `c2` | `glm-5.3` | multi-step coding, structured reasoning, larger context |
+| `c3` | `claude-opus-5` | difficult planning, deep review, high-stakes synthesis |
+| `image_model` | `glm-5.3-flash` | image attachments, screenshots, diagrams |
+
+The image tier differs from the OpenCAP profile: Surplus publishes `minimax-m3`
+without vision in its supported features, and `glm-5.3-flash` is both
+vision-capable and the cheapest such route it serves.
+
+Because prices move with seller competition, cost estimates come from the live
+catalog rather than a static table. At gateway boot AgentOS fetches it once and
+reuses that response to seed pricing; the cache refreshes on its own TTL
+afterwards. Set `AGENTOS_SURPLUS_LIVE_PRICING=0` to pin estimates to the static
+table instead. If the fetch fails, configured models still run on static
+capability and cost fallbacks.
+
+Surplus routes to the cheapest eligible seller when no route is configured. To
+restrict one model to particular sellers, use bare model IDs and a seller ID
+advertised by the current live catalog:
+
+```toml
+[llm.provider_routing]
+"glm-5.3" = "seller-id-from-live-catalog"
+```
+
+AgentOS sends this as Surplus's provider allow-list, the same shape OpenCAP
+takes.
 
 ## Model Inspection
 

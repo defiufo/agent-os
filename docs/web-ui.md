@@ -407,8 +407,9 @@ screen says so when that is the case.
 Two things the screen deliberately makes visible:
 
 - **Locked variables.** Names that steer subprocess execution or AgentOS
-  runtime posture (`PATH`, `LD_PRELOAD`, `AGENTOS_AGENT_PERMISSIONS`, …) show a
-  lock instead of an edit control. See
+  runtime posture, or outbound routing (`PATH`, `LD_PRELOAD`,
+  `AGENTOS_AGENT_PERMISSIONS`, `HTTP_PROXY`, …) show a lock instead of an edit
+  control. See
   [configuration.md](configuration.md#what-cannot-be-written-through-agentos).
 - **Shadowed variables.** If the shell that started the gateway exported a
   variable, that value wins over the file and editing here has no effect until

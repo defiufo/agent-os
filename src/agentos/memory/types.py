@@ -42,9 +42,12 @@ def normalize_memory_search_min_score(
 class MemorySource(StrEnum):
     memory = "memory"
     sessions = "sessions"
+    knowledge_base = "knowledge_base"
 
 
-def normalize_memory_source_filter(value: object, *, allow_all: bool = True) -> MemorySource | None:
+def normalize_memory_source_filter(
+    value: object, *, allow_all: bool = True
+) -> MemorySource | None:
     if value is None:
         return None
     if isinstance(value, MemorySource):
@@ -54,10 +57,16 @@ def normalize_memory_source_filter(value: object, *, allow_all: bool = True) -> 
         return None
     if allow_all and raw == "all":
         return None
+    if raw in ("knowledge_base", "knowledge-base", "knowledge", "kb", "docs"):
+        return MemorySource.knowledge_base
     try:
         return MemorySource(raw)
     except ValueError as exc:
-        allowed = "'all', 'memory', or 'sessions'" if allow_all else "'memory' or 'sessions'"
+        allowed = (
+            "'all', 'memory', 'knowledge_base', or 'sessions'"
+            if allow_all
+            else "'memory', 'knowledge_base', or 'sessions'"
+        )
         raise ValueError(f"source must be {allowed}") from exc
 
 

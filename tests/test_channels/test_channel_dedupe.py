@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import hashlib
+import hmac
 import json
+import time
 
 import pytest
 
@@ -9,11 +12,22 @@ from agentos.channels.msteams import MSTeamsChannel, MSTeamsChannelConfig
 from agentos.channels.slack import SlackChannel
 from agentos.channels.types import IncomingMessage
 
+_SIGNING_SECRET = "s3cr3t"
+
 
 class _BodyRequest:
-    def __init__(self, payload: dict) -> None:
+    def __init__(self, payload: dict, *, signing_secret: str = _SIGNING_SECRET) -> None:
         self._body = json.dumps(payload).encode()
-        self.headers: dict[str, str] = {}
+        timestamp = str(int(time.time()))
+        digest = hmac.HMAC(
+            signing_secret.encode(),
+            f"v0:{timestamp}:{self._body.decode()}".encode(),
+            hashlib.sha256,
+        ).hexdigest()
+        self.headers: dict[str, str] = {
+            "X-Slack-Request-Timestamp": timestamp,
+            "X-Slack-Signature": f"v0={digest}",
+        }
 
     async def body(self) -> bytes:
         return self._body
@@ -21,7 +35,7 @@ class _BodyRequest:
 
 @pytest.mark.asyncio
 async def test_slack_webhook_dedupes_retried_event_callback() -> None:
-    channel = SlackChannel(token="xoxb-test", slack_channel_id="C1")
+    channel = SlackChannel(token="xoxb-test", slack_channel_id="C1", signing_secret=_SIGNING_SECRET)
     payload = {
         "type": "event_callback",
         "event_id": "Ev123",

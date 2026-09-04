@@ -31,8 +31,26 @@ def _patch_response(monkeypatch: pytest.MonkeyPatch, response: httpx.Response) -
         async def __aexit__(self, *args: object) -> None:
             return None
 
-        async def request(self, **kwargs: object) -> httpx.Response:
-            return response
+        def build_request(
+            self,
+            method: str,
+            url: str,
+            *,
+            headers: dict[str, str] | None = None,
+            content: bytes | None = None,
+        ) -> httpx.Request:
+            return httpx.Request(method, url, headers=headers, content=content)
+
+        async def send(self, request: httpx.Request, **kwargs: object) -> httpx.Response:
+            # Re-bind the pre-built response to the request actually in flight,
+            # preserving any pre-seeded body as an async stream so the streaming
+            # download path can iterate over it.
+            return httpx.Response(
+                response.status_code,
+                headers=dict(response.headers),
+                content=response.content,
+                request=request,
+            )
 
     monkeypatch.setattr(web.httpx, "AsyncClient", FakeAsyncClient)
 
@@ -126,6 +144,24 @@ async def test_http_request_uses_body_base64_when_content_type_missing(
     assert payload["content_type"] == ""
     assert payload["body"] is None
     assert base64.b64decode(payload["body_base64"]) == raw
+
+
+@pytest.mark.asyncio
+async def test_http_request_honors_response_charset(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    raw = "café".encode("iso-8859-1")
+    _patch_response(
+        monkeypatch,
+        httpx.Response(
+            200,
+            content=raw,
+            headers={"content-type": "text/plain; charset=iso-8859-1"},
+            request=httpx.Request("GET", "https://example.test/latin1"),
+        ),
+    )
+    payload = json.loads(await _original_http_request()(url="https://example.test/latin1"))
+    assert "café" in payload["body"]
 
 
 @pytest.mark.asyncio
@@ -331,3 +367,101 @@ async def test_http_request_without_output_path_does_not_create_fetch_directory(
     assert first["path"] is None
     assert second["path"] is None
     assert not (tmp_path / ".fetch").exists()
+
+
+class _StreamingAsyncClient:
+    """AsyncClient whose request() returns a streaming httpx.Response.
+
+    The handler builds the response body lazily (chunked, no content-length) so
+    the test can assert the tool stops reading near the download ceiling instead
+    of buffering the entire body into memory.
+    """
+
+    def __init__(
+        self, handler: Callable[[httpx.Request], httpx.Response], **kwargs: object
+    ) -> None:
+        self._handler = handler
+
+    async def __aenter__(self) -> _StreamingAsyncClient:
+        return self
+
+    async def __aexit__(self, *args: object) -> None:
+        return None
+
+    def build_request(
+        self,
+        method: str,
+        url: str,
+        *,
+        headers: dict[str, str] | None = None,
+        content: bytes | None = None,
+    ) -> httpx.Request:
+        return httpx.Request(method, url, headers=headers, content=content)
+
+    async def send(self, request: httpx.Request, **kwargs: object) -> httpx.Response:
+        return self._handler(request)
+
+
+class _AsyncBody(httpx.AsyncByteStream):
+    def __init__(self, total: int, chunk: int = 256 * 1024) -> None:
+        self._remaining = total
+        self._chunk = chunk
+
+    async def __aiter__(self):
+        while self._remaining > 0:
+            n = min(self._chunk, self._remaining)
+            self._remaining -= n
+            yield b"A" * n
+
+
+@pytest.mark.asyncio
+async def test_http_request_caps_download_at_hard_byte_limit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Serve a 50MB chunked body (no content-length). The tool must stop reading
+    # near the 1MiB download cap, not buffer the whole body into RAM.
+    total = 50 * 1024 * 1024
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            headers={"content-type": "application/octet-stream"},
+            stream=_AsyncBody(total),
+            request=request,
+        )
+
+    monkeypatch.setattr(web.httpx, "AsyncClient", lambda *a, **k: _StreamingAsyncClient(handler))
+
+    payload = json.loads(await _original_http_request()(url="https://example.test/huge"))
+
+    assert payload["download_capped"] is True
+    assert payload["body_base64_truncated"] is True
+    assert payload["body_saved"] is False
+    assert payload["size"] <= 1_000_000 + _STREAM_CHUNK, payload["size"]
+    assert payload["size"] < total
+
+
+@pytest.mark.asyncio
+async def test_http_request_env_overrides_download_limit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("AGENTOS_HTTP_DOWNLOAD_LIMIT", "200000")
+    total = 5 * 1024 * 1024
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            headers={"content-type": "application/octet-stream"},
+            stream=_AsyncBody(total),
+            request=request,
+        )
+
+    monkeypatch.setattr(web.httpx, "AsyncClient", lambda *a, **k: _StreamingAsyncClient(handler))
+
+    payload = json.loads(await _original_http_request()(url="https://example.test/huge"))
+
+    assert payload["download_capped"] is True
+    assert payload["size"] <= 200_000 + _STREAM_CHUNK, payload["size"]
+
+
+_STREAM_CHUNK = 65_536

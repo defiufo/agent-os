@@ -36,10 +36,21 @@ class _FakeStdin:
         return None
 
 
+class _FakeStdout:
+    def __init__(self, chunks: list[bytes]) -> None:
+        self.chunks = list(chunks)
+        self.read_calls = 0
+
+    async def read(self, _limit: int) -> bytes:
+        self.read_calls += 1
+        return self.chunks.pop(0)
+
+
 @dataclass
 class _FakeProcess:
     returncode: int | None = None
     stdin: _FakeStdin | None = None
+    stdout: _FakeStdout | None = None
 
     def __post_init__(self) -> None:
         if self.stdin is None:
@@ -104,6 +115,46 @@ def test_background_process_result_surfaces_local_http_server_url() -> None:
     assert "local_urls:" in result
     assert "- http://127.0.0.1:8080/" in result
     assert "include the local URL" in result
+
+
+@pytest.mark.asyncio
+async def test_background_output_is_capped_while_stdout_is_fully_drained(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(shell, "_MAX_BACKGROUND_OUTPUT_CHARS", 10)
+    stdout = _FakeStdout([b"abcdef", b"ghijkl", b"mnop", b""])
+    session = shell._BgSession(
+        session_id="noisy",
+        command="noisy command",
+        process=_FakeProcess(returncode=0, stdout=stdout),  # type: ignore[arg-type]
+        session_key="agent:main:one",
+    )
+
+    await shell._read_bg_output(session)
+
+    assert "".join(session.output_lines) == "ghijklmnop"
+    assert session.output_chars == 10
+    assert session.output_truncated is True
+    assert stdout.read_calls == 4
+
+
+@pytest.mark.asyncio
+async def test_process_log_reports_background_output_truncation() -> None:
+    session = _session("noisy", "agent:main:one", done=True)
+    session.output_lines = ["abcdefghij"]
+    session.output_chars = 10
+    session.output_truncated = True
+    shell._bg_sessions[session.session_id] = session
+
+    token = current_tool_context.set(_ctx("agent:main:one"))
+    try:
+        payload = json.loads(await shell.process("log", session_id=session.session_id))
+    finally:
+        current_tool_context.reset(token)
+
+    assert payload["output"] == "abcdefghij"
+    assert payload["truncated"] is True
+    assert payload["session"]["output_truncated"] is True
 
 
 @pytest.mark.skipif(os.name != "posix", reason="process group behavior is POSIX-specific")

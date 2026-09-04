@@ -39,6 +39,7 @@ from agentos.sandbox.integration import (
 )
 from agentos.sandbox.policy import build_policy, select_level
 from agentos.sandbox.types import DenialReason, DenialResult, SandboxPolicy, SandboxRequest
+from agentos.tools.builtin.artifacts import publish_inline_artifacts
 from agentos.tools.builtin.shell_policy import check_safe_bin
 from agentos.tools.env_passthrough import build_subprocess_env
 from agentos.tools.path_policy import reject_foreign_host_path
@@ -61,6 +62,7 @@ _DEFAULT_BACKGROUND_TIMEOUT = 1800.0
 _MAX_BACKGROUND_TIMEOUT = 3600.0
 _BACKGROUND_TERMINATE_TIMEOUT = 1.0
 _BACKGROUND_KILL_TIMEOUT = 1.0
+_MAX_BACKGROUND_OUTPUT_CHARS = 1_000_000
 _EXEC_TERMINATE_TIMEOUT = 0.25
 _EXEC_KILL_TIMEOUT = 0.25
 _COMMAND_AUDIT_MAX_CHARS = 4096
@@ -100,6 +102,8 @@ class _BgSession:
     agent_id: str | None = None
     local_urls: list[str] = field(default_factory=list)
     output_lines: list[str] = field(default_factory=list)
+    output_chars: int = 0
+    output_truncated: bool = False
     done: bool = False
     timed_out: bool = False
     killed: bool = False
@@ -475,6 +479,8 @@ def _bg_session_payload(session: _BgSession) -> dict[str, object]:
         "ended_at": session.ended_at,
         "killed": session.killed,
         "timed_out": session.timed_out,
+        "output_chars": session.output_chars,
+        "output_truncated": session.output_truncated,
     }
     if session.local_urls:
         payload["local_urls"] = list(session.local_urls)
@@ -562,7 +568,34 @@ async def _read_bg_output(session: _BgSession) -> None:
     if stdout is None:
         return
     while chunk := await stdout.read(4096):
-        session.output_lines.append(chunk.decode("utf-8", errors="replace"))
+        _append_bg_output(session, chunk.decode("utf-8", errors="replace"))
+
+
+def _append_bg_output(session: _BgSession, output: str) -> None:
+    """Retain the bounded output tail while continuing to drain stdout."""
+    if not output:
+        return
+
+    session.output_lines.append(output)
+    session.output_chars += len(output)
+    truncated_now = session.output_chars > _MAX_BACKGROUND_OUTPUT_CHARS
+    while session.output_chars > _MAX_BACKGROUND_OUTPUT_CHARS:
+        overflow = session.output_chars - _MAX_BACKGROUND_OUTPUT_CHARS
+        first = session.output_lines[0]
+        if len(first) <= overflow:
+            session.output_lines.pop(0)
+            session.output_chars -= len(first)
+        else:
+            session.output_lines[0] = first[overflow:]
+            session.output_chars -= overflow
+
+    if truncated_now and not session.output_truncated:
+        session.output_truncated = True
+        log.warning(
+            "shell.bg_output_truncated",
+            session_id=session.session_id,
+            max_chars=_MAX_BACKGROUND_OUTPUT_CHARS,
+        )
 
 
 def _finalize_bg_session(session: _BgSession) -> None:
@@ -789,6 +822,7 @@ async def exec_command(
                 output = redact_terminal_output(
                     stdout_bytes.decode("utf-8", errors="replace"), command
                 )
+                output = await publish_inline_artifacts(output)
                 return f"exit_code={proc.returncode}\n{output}"
             except Exception as e:
                 return f"[error] {e}"
@@ -796,6 +830,7 @@ async def exec_command(
         if sandbox_result.stderr:
             output += sandbox_result.stderr
         output = _append_sandbox_network_hint(redact_terminal_output(output, command))
+        output = await publish_inline_artifacts(output)
         return f"exit_code={sandbox_result.returncode}\n{output}"
 
     if elevated_bypass:
@@ -828,6 +863,7 @@ async def exec_command(
             output = redact_terminal_output(
                 output_file.read().decode("utf-8", errors="replace"), command
             )
+            output = await publish_inline_artifacts(output)
             return f"exit_code={proc.returncode}\n{output}"
     except Exception as e:
         return f"[error] {e}"
@@ -937,7 +973,7 @@ async def background_process(
             except TimeoutError:
                 session.timed_out = True
                 await _terminate_bg_session(session)
-                session.output_lines.append(f"[timeout after {effective_timeout}s]\n")
+                _append_bg_output(session, f"[timeout after {effective_timeout}s]\n")
             finally:
                 await _await_bg_output_task(output_task)
                 _finalize_bg_session(session)
@@ -989,7 +1025,7 @@ async def background_process(
         except TimeoutError:
             session.timed_out = True
             await _terminate_bg_session(session)
-            session.output_lines.append(f"[timeout after {effective_timeout}s]\n")
+            _append_bg_output(session, f"[timeout after {effective_timeout}s]\n")
         finally:
             await _await_bg_output_task(output_task)
             _finalize_bg_session(session)
@@ -1143,7 +1179,7 @@ async def process(
                 "output": sliced,
                 "offset": start,
                 "limit": max_chars,
-                "truncated": start > 0 or end < len(output),
+                "truncated": session.output_truncated or start > 0 or end < len(output),
             }
         )
 

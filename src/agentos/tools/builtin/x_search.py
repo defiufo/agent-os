@@ -58,6 +58,7 @@ from agentos.env import trust_env as _trust_env
 from agentos.sandbox.integration import sandboxed
 from agentos.tools.registry import tool
 from agentos.tools.ssrf import assert_not_metadata_endpoint
+from agentos.tools.ssrf_client import ssrf_guarded_client, validate_metadata_only_address
 
 log = structlog.get_logger(__name__)
 
@@ -392,7 +393,12 @@ async def _post_with_retries(
     """POST to xAI, retrying transient failures inside the total budget."""
     attempt = 0
     last_exc: Exception | None = None
-    async with httpx.AsyncClient(trust_env=_trust_env()) as client:
+    # Same floor the configured base URL was checked against, re-applied to the
+    # address the socket dials: a bearer token rides on every request here, so a
+    # rebinding host must not be able to redirect it to the metadata endpoint.
+    async with ssrf_guarded_client(
+        trust_env=_trust_env(), validator=validate_metadata_only_address
+    ) as client:
         while True:
             remaining = deadline - time.monotonic()
             if remaining <= 0:

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
+from typing import Any
 from urllib.parse import quote, unquote, urlparse
 
 import structlog
@@ -124,6 +125,47 @@ def _decode_file(path: str, content: bytes) -> str | bytes:
         return content.decode("utf-8")
     except UnicodeDecodeError:
         return content
+
+
+# Remote skill blobs are community-controlled — bound what we will buffer.
+# Without a ceiling, a single oversized blob (or a tree full of them) is read
+# fully into RAM via ``raw_resp.content`` and can OOM the installer. These sit
+# far above any real skill file and far below what it takes to exhaust memory.
+_MAX_BLOB_BYTES = 8 * 1024 * 1024  # uncompressed, per blob
+_MAX_TOTAL_BYTES = 32 * 1024 * 1024  # whole skill directory
+_STREAM_CHUNK_BYTES = 64 * 1024
+
+
+async def _read_capped(resp: Any, limit: int) -> bytes | None:
+    """Read a streamed blob response, returning ``None`` once it exceeds *limit*.
+
+    ``Content-Length`` and ``info.file_size`` are attacker-controlled metadata,
+    so they are only a first filter; this running total is what actually stops a
+    blob that lies about how much it expands to.
+    """
+    chunks: list[bytes] = []
+    total = 0
+    async for chunk in resp.aiter_bytes(_STREAM_CHUNK_BYTES):
+        total += len(chunk)
+        if total > limit:
+            return None
+        chunks.append(chunk)
+    return b"".join(chunks)
+
+
+async def _fetch_blob(
+    client: Any, raw_url: str, headers: dict[str, str], limit: int
+) -> bytes | None:
+    # stream=True is essential: a plain client.get() would buffer the entire
+    # blob into response.content BEFORE _read_capped could stop the read, so
+    # the cap would only truncate what we keep, not what we download.
+    request = client.build_request("GET", raw_url, headers=headers)
+    raw_resp = await client.send(request, stream=True)
+    raw_resp.raise_for_status()
+    try:
+        return await _read_capped(raw_resp, limit)
+    finally:
+        await raw_resp.aclose()
 
 
 # YAML block-scalar indicator: > or |, one optional chomping/indentation
@@ -265,6 +307,7 @@ class GitHubSource(SkillSource):
                     return None
 
                 files: dict[str, str | bytes] = {}
+                budget = _MAX_TOTAL_BYTES
                 for item in tree_data.get("tree", []):
                     path = str(item.get("path") or "")
                     if item.get("type") != "blob":
@@ -276,9 +319,18 @@ class GitHubSource(SkillSource):
                         f"https://raw.githubusercontent.com/{ref.repo_full}/"
                         f"{quote(ref.ref, safe='')}/{quote(path, safe='/')}"
                     )
-                    raw_resp = await client.get(raw_url, headers=self._headers())
-                    raw_resp.raise_for_status()
-                    files[rel_path] = _decode_file(rel_path, raw_resp.content)
+                    blob_limit = min(_MAX_BLOB_BYTES, budget)
+                    raw = await _fetch_blob(client, raw_url, self._headers(), blob_limit)
+                    if raw is None:
+                        log.warning(
+                            "github.fetch_blob_over_cap",
+                            identifier=identifier,
+                            path=path,
+                            limit=blob_limit,
+                        )
+                        return None
+                    budget -= len(raw)
+                    files[rel_path] = _decode_file(rel_path, raw)
         except Exception as exc:
             log.warning("github.fetch_failed", identifier=identifier, error=str(exc))
             return None

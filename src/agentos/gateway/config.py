@@ -133,6 +133,15 @@ class RateLimitConfig(BaseSettings):
     enabled: bool = True
     max_requests: int = 100
     window_seconds: int = 60
+    # Dedicated cap for ``GET /api/approvals``, counted in its own per-IP
+    # window (same ``window_seconds``). The Control UI polls that endpoint
+    # every 1.5s (~40 req/min per open tab, ApprovalMonitor.POLL_MS), so
+    # charging it to the shared ``max_requests`` bucket would 429 the operator
+    # out of the approval queue with two or three tabs open. It is bounded
+    # rather than exempt: the handler serializes every pending command/argv
+    # and takes a SQLite read on each poll, so an unlimited endpoint is an
+    # enumeration + lock-contention lever for anyone who reaches the gateway.
+    approvals_max_requests: int = Field(default=300, ge=1)
 
 
 class ControlUiConfig(BaseSettings):
@@ -796,13 +805,126 @@ def _bankr_tiers() -> dict:
 def _opencap_tiers() -> dict:
     """OpenCAP routing config using neutral bare model ids served by its gateway.
 
+    Declared separately from ``_bankr_tiers`` rather than copied from it. The two
+    gateways publish overlapping but not identical catalogs, and only OpenCAP
+    exposes a public catalog we can check a default against -- so a model that is
+    current on one is not automatically current on the other, and cloning the
+    table made OpenCAP silently inherit Bankr's release cadence.
+
     Safety-sensitive models such as ``oc-uncensored-1.0`` remain available as
     explicit user overrides, but are never selected by the recommended profile.
     """
-    tiers = _bankr_tiers()
-    for tier in tiers.values():
-        tier["provider"] = "opencap"
-    return tiers
+    return {
+        "c0": _tier(
+            provider="opencap",
+            model="deepseek-v4-flash",
+            description=(
+                "fast DeepSeek V4 Flash route for trivial chat, short rewrites, extraction, and "
+                "low-risk simple Q&A"
+            ),
+            thinking_level="high",
+        ),
+        "c1": _tier(
+            provider="opencap",
+            model="gpt-5.6-luna",
+            description=(
+                "default balanced text model for normal agent work, coding assistance, debugging, "
+                "and moderate analysis"
+            ),
+            thinking_level="high",
+        ),
+        "c2": _tier(
+            provider="opencap",
+            model="glm-5.3",
+            description=(
+                "stronger text model for multi-step coding, structured reasoning, larger context "
+                "synthesis, and harder analysis"
+            ),
+            thinking_level="high",
+        ),
+        "c3": _tier(
+            provider="opencap",
+            model="claude-opus-5",
+            description=(
+                "Highest-quality text reasoning model for difficult planning, deep review, complex "
+                "debugging, and high-stakes synthesis"
+            ),
+            thinking_level="high",
+        ),
+        "image_model": _tier(
+            provider="opencap",
+            model="minimax-m3",
+            description=(
+                "Image model: vision-capable route for user-supplied image attachments, "
+                "screenshots, diagrams, and visual question answering"
+            ),
+            thinking_level="medium",
+            image_only=True,
+        ),
+    }
+
+
+def _surplus_tiers() -> dict:
+    """Surplus Intelligence routing config over the bare ids its market serves.
+
+    Surplus is a marketplace: every tier resolves to whichever seller is
+    cheapest for that id at request time, so the defaults below pin capability
+    tiers rather than a particular vendor's endpoint. Each id was checked
+    against the live public catalog.
+
+    The image tier is ``glm-5.3-flash`` rather than the ``minimax-m3`` the
+    OpenCAP profile uses: Surplus publishes ``minimax-m3`` without vision in
+    its supported features, and ``glm-5.3-flash`` is both vision-capable and
+    the cheapest such route in the catalog.
+    """
+    return {
+        "c0": _tier(
+            provider="surplus",
+            model="deepseek-v4-flash",
+            description=(
+                "fast DeepSeek V4 Flash route for trivial chat, short rewrites, extraction, and "
+                "low-risk simple Q&A"
+            ),
+            thinking_level="high",
+        ),
+        "c1": _tier(
+            provider="surplus",
+            model="gpt-5.6-luna",
+            description=(
+                "default balanced text model for normal agent work, coding assistance, debugging, "
+                "and moderate analysis"
+            ),
+            thinking_level="high",
+        ),
+        "c2": _tier(
+            provider="surplus",
+            model="glm-5.3",
+            description=(
+                "stronger text model for multi-step coding, structured reasoning, larger context "
+                "synthesis, and harder analysis"
+            ),
+            thinking_level="high",
+        ),
+        "c3": _tier(
+            provider="surplus",
+            model="claude-opus-5",
+            description=(
+                "Highest-quality text reasoning model for difficult planning, deep review, complex "
+                "debugging, and high-stakes synthesis"
+            ),
+            thinking_level="high",
+        ),
+        "image_model": _tier(
+            provider="surplus",
+            model="glm-5.3-flash",
+            description=(
+                "Image model: vision-capable route for user-supplied image attachments, "
+                "screenshots, diagrams, and visual question answering"
+            ),
+            thinking_level="medium",
+            image_only=True,
+        ),
+    }
 
 
 def _openrouter_tiers() -> dict:
@@ -861,6 +983,7 @@ ROUTER_TIER_PROFILE_IDS = frozenset(
     {
         "bankr",
         "opencap",
+        "surplus",
         "openrouter",
         "dashscope",
         "deepseek",
@@ -900,6 +1023,8 @@ def _router_tier_profile_defaults(profile: str | None) -> dict:
         return _bankr_tiers()
     if normalized == "opencap":
         return _opencap_tiers()
+    if normalized == "surplus":
+        return _surplus_tiers()
     if normalized == "openrouter":
         return _openrouter_tiers()
     profiles = {
@@ -1667,6 +1792,49 @@ class MSTeamsChannelEntry(ConfiguredChannelEntry):
     webhook_path: str = "/msteams/messages"
 
 
+class EmailChannelEntry(ConfiguredChannelEntry):
+    """Gateway config entry for an IMAP/SMTP email channel."""
+
+    type: Literal["email"] = "email"
+    imap_host: str
+    imap_port: int = Field(default=993, ge=1, le=65535)
+    imap_ssl: bool = True
+    imap_username: str
+    imap_password: str = ""
+    imap_folder: str = "INBOX"
+    smtp_host: str
+    smtp_port: int = Field(default=587, ge=1, le=65535)
+    smtp_ssl: bool = False
+    smtp_starttls: bool = True
+    smtp_username: str = ""
+    smtp_password: str = ""
+    from_address: str
+    from_name: str = ""
+    allowed_senders: list[str] = Field(default_factory=list)
+    poll_interval_s: float = Field(default=30.0, ge=1.0, le=3600.0)
+    max_messages_per_poll: int = Field(default=10, ge=1, le=200)
+    max_message_bytes: int = Field(default=25 * 1024 * 1024, ge=1024)
+    mark_seen: bool = True
+    connect_timeout_s: float = Field(default=30.0, ge=1.0, le=300.0)
+
+    @field_validator("allowed_senders", mode="before")
+    @classmethod
+    def _normalize_allowed_senders(cls, value: Any) -> list[str]:
+        values = value.split(",") if isinstance(value, str) else (value or [])
+        normalized = (str(item).strip().lower() for item in values)
+        return list(dict.fromkeys(item for item in normalized if item))
+
+    @model_validator(mode="after")
+    def _validate_email_entry(self) -> EmailChannelEntry:
+        # Fail closed: an inbox with no allowlist would let any stranger who
+        # can send mail drive the agent.
+        if not self.allowed_senders:
+            raise ValueError("email channels require at least one allowed_senders entry")
+        if "@" not in self.from_address:
+            raise ValueError("email from_address must be a full address")
+        return self
+
+
 class TelegramChannelEntry(ConfiguredChannelEntry):
     """Gateway config entry for a Telegram Bot API channel."""
 
@@ -1799,6 +1967,37 @@ class SubagentsGatewayConfig(BaseModel):
 
     prompt_compact: bool = False
     """When enabled, subagent bootstrap prompts keep only AGENTS.md and TOOLS.md."""
+
+
+class ObservabilityConfig(BaseSettings):
+    """Observability, Prometheus metrics, OTLP trace export, and log retention configuration."""
+
+    model_config = SettingsConfigDict(
+        env_prefix="AGENTOS_OBSERVABILITY_",
+        extra="forbid",
+    )
+
+    metrics_enabled: bool = True
+    metrics_path: str = "/metrics"
+
+    otlp_enabled: bool = False
+    otlp_endpoint: str = ""
+    otlp_headers: dict[str, str] = Field(default_factory=dict)
+    otlp_service_name: str = "agentos"
+
+    log_retention_days: int = Field(default=14, ge=0)
+    log_retention_max_total_mb: int = Field(default=500, ge=0)
+    log_retention_sweep_interval_s: float = Field(default=3600.0, gt=0)
+
+    @field_validator("metrics_path")
+    @classmethod
+    def _validate_metrics_path(cls, value: str) -> str:
+        path = value.strip()
+        if not path:
+            return "/metrics"
+        if not path.startswith("/"):
+            path = "/" + path
+        return path
 
 
 class UpdatesConfig(BaseModel):
@@ -2020,6 +2219,7 @@ class GatewayConfig(BaseSettings):
     agents: list[AgentEntryConfig] = Field(default_factory=list)
     agents_defaults: AgentDefaults = Field(default_factory=AgentDefaults)
     subagents: SubagentsGatewayConfig = Field(default_factory=SubagentsGatewayConfig)
+    observability: ObservabilityConfig = Field(default_factory=ObservabilityConfig)
     budgets: BudgetsConfig = Field(default_factory=BudgetsConfig)
 
     updates: UpdatesConfig = Field(default_factory=UpdatesConfig)
@@ -2076,6 +2276,7 @@ class GatewayConfig(BaseSettings):
             _openrouter_tiers(),
             _bankr_tiers(),
             _opencap_tiers(),
+            _surplus_tiers(),
         )
         if "tier_profile" in fields_set or has_custom_tiers:
             return self
@@ -2138,6 +2339,20 @@ class GatewayConfig(BaseSettings):
         payload["judge_model"] = None
         payload["judge_provider"] = None
         self.agentos_router = AgentOSRouterConfig(**payload)
+        return self
+
+    @model_validator(mode="after")
+    def _validate_observability_metrics_path(self) -> GatewayConfig:
+        observability = getattr(self, "observability", None)
+        control_ui = getattr(self, "control_ui", None)
+        if observability is not None and control_ui is not None:
+            ui_base = control_ui.base_path.rstrip("/")
+            metrics_path = observability.metrics_path.rstrip("/")
+            if metrics_path == ui_base or metrics_path.startswith(f"{ui_base}/"):
+                raise ValueError(
+                    f"observability.metrics_path ({observability.metrics_path}) cannot overlap "
+                    f"or be located under control_ui.base_path ({control_ui.base_path})"
+                )
         return self
 
     # --- Context overflow policy -----------------------------------------

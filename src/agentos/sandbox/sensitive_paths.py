@@ -74,6 +74,27 @@ _SENSITIVE_SUFFIXES: tuple[str, ...] = (
 
 _WORKSPACE_PARENT_EXCEPTION_MARKERS: tuple[str, ...] = ("/root",)
 
+# Marker reported when a destructive intent targets the filesystem root. Root
+# is not in ``_SENSITIVE_PREFIXES`` on purpose: reading or listing ``/`` is
+# harmless, so only the delete-intent scan treats it as sensitive.
+_ROOT_TARGET_MARKER = "/"
+
+# Path segments that keep a target at the filesystem root: ``/``, ``/.``,
+# ``/..`` and ``//`` all resolve to root.
+_ROOT_TARGET_SEGMENTS = frozenset({"", ".", "..", "*"})
+
+# A segment made only of glob metacharacters and dots expands across every
+# entry of its parent, so at depth 1 it is a root wipe by another spelling:
+# ``/*``, ``/**``, ``/?*``, ``/.*`` and ``/[a-z]*`` all sweep the top level.
+# Bracket expressions are dropped first so ``/[a-z]*`` counts while a segment
+# carrying literal text (``/tmp*``) does not.
+_BRACKET_EXPRESSION_RE = re.compile(r"\[[^]]*\]")
+_GLOB_ONLY_CHARS = frozenset("*?.")
+
+# Windows runners resolve ``/`` to a drive root (``C:\``), so the drive letter
+# is stripped before the segment check.
+_DRIVE_PREFIX_RE = re.compile(r"^[A-Za-z]:")
+
 _TOKEN_EDGE_CHARS = " \t\r\n'\"`$(){}[]<>;,|&"
 _ABSOLUTE_OR_TILDE_PATH_RE = re.compile(r"(?:~)?/(?:[^\s'\"`$(){}\[\]<>;,|&]+)")
 _DOTENV_LITERAL_RE = re.compile(
@@ -124,6 +145,37 @@ def _path_contains(path: str, root: str) -> bool:
     normalized_root = root.rstrip("/")
     return normalized_path == normalized_root or normalized_path.startswith(
         normalized_root + "/"
+    )
+
+
+def _segment_sweeps_its_parent(segment: str) -> bool:
+    """Return whether *segment* is a glob matching every entry beside it.
+
+    ``*``, ``**``, ``?*``, ``.*`` and ``[a-z]*`` all do; ``tmp*`` does not,
+    because the literal text narrows it to a named subset.
+    """
+    if "*" not in segment and "?" not in segment:
+        return False
+    literal = _BRACKET_EXPRESSION_RE.sub("", segment)
+    return all(char in _GLOB_ONLY_CHARS for char in literal)
+
+
+def _is_root_target(path: str) -> bool:
+    """Return whether *path* names — or sweeps — the filesystem root.
+
+    ``rm -rf /`` and its spellings carry no sensitive prefix, so the prefix
+    scan never matched them. A target is root when every segment either
+    resolves in place (empty, ``.``, ``..``) or globs across the whole level,
+    covering ``/``, ``//``, ``/.``, ``/..``, ``/*``, ``/**``, ``/.*`` and
+    ``/*/*``.
+    """
+    normalized = str(path).strip().replace("\\", "/")
+    normalized = _DRIVE_PREFIX_RE.sub("", normalized, count=1)
+    if not normalized.startswith("/"):
+        return False
+    return all(
+        segment in _ROOT_TARGET_SEGMENTS or _segment_sweeps_its_parent(segment)
+        for segment in normalized.split("/")
     )
 
 
@@ -319,6 +371,8 @@ def sensitive_target_in_command(
 
     Multi-target commands (``rm /tmp/ok /etc/bad``) are each checked — the
     presence of a single sensitive path is enough to block the whole command.
+    The filesystem root is sensitive here and only here: deleting ``/`` wipes
+    the host, while reading or listing it is ordinary work.
 
     Honors :data:`_DISABLED` (env var ``AGENTOS_SENSITIVE_PATHS_DISABLED``).
     """
@@ -331,6 +385,8 @@ def sensitive_target_in_command(
         effective_workspace = cwd if cwd is not None else Path.cwd()
 
     for _kind, target in _extract_intents(command, base_dir=effective_workspace):
+        if _is_root_target(target):
+            return _ROOT_TARGET_MARKER
         marker = sensitive_path_marker(target, workspace=effective_workspace)
         if marker is not None:
             return marker

@@ -10,8 +10,11 @@ from agentos.skills.types import SkillLayer, SkillSpec
 #: Kept here rather than at each call site: the same number is the default for
 #: ``skills.max_skills_prompt_chars`` and the fallback the turn pipeline uses
 #: when a turn arrives without a skills config, and those two drifting apart is
-#: what silently forced default installs into name-only mode.
-DEFAULT_MAX_SKILLS_PROMPT_CHARS = 24_000
+#: what silently forced default installs into name-only mode. It has to stay
+#: ahead of the shipped set's own descriptions — see
+#: ``test_the_lifted_value_fits_the_shipped_skills_in_full_mode``, which is what
+#: catches the budget going stale as bundled skills are added.
+DEFAULT_MAX_SKILLS_PROMPT_CHARS = 26_000
 
 #: How the block was rendered, widest first. Recorded per turn so a fall to a
 #: narrower mode is a visible fact rather than something an operator has to

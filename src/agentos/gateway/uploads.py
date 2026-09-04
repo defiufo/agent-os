@@ -39,6 +39,7 @@ from agentos.contracts.attachments import (
     attachment_size_limit_for_mime,
     normalize_attachment_mime,
 )
+from agentos.gateway.auth import token_matches
 from agentos.gateway.config import GatewayConfig
 
 log = logging.getLogger(__name__)
@@ -366,7 +367,9 @@ def register_upload_routes(
 
     async def upload_handler(request: Request) -> JSONResponse:
         if config.auth.mode == "token":
-            if config.auth.token and _extract_authorization_token(request) != config.auth.token:
+            if config.auth.token and not token_matches(
+                _extract_authorization_token(request), config.auth.token
+            ):
                 return JSONResponse(
                     {
                         "error": (

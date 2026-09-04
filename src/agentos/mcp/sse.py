@@ -8,8 +8,8 @@ from typing import Any, cast
 import httpx
 
 from agentos import __version__
-from agentos.env import trust_env as _trust_env
 from agentos.mcp.client import MCPClient
+from agentos.mcp.http import mcp_http_client
 from agentos.mcp.types import MCPServerConfig, MCPToolDef, MCPToolResult
 
 
@@ -70,7 +70,9 @@ class MCPSSEClient(MCPClient):
 
     async def connect(self) -> None:
         """Create the HTTP client session and perform MCP initialization handshake."""
-        self._client = httpx.AsyncClient(trust_env=_trust_env())
+        if not self.config.url:
+            raise ValueError("SSE MCP server requires a URL")
+        self._client = mcp_http_client(self.config.url)
 
         # Send initialize request (response is acknowledged server-side;
         # we don't inspect it — the MCP spec only requires us to send the

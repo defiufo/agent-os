@@ -16,8 +16,8 @@ from typing import Any
 import httpx
 
 from agentos import __version__
-from agentos.env import trust_env as _trust_env
 from agentos.mcp.client import MCPClient
+from agentos.mcp.http import assert_supported_mcp_url, mcp_http_client
 from agentos.mcp.types import MCPServerConfig, MCPToolDef, MCPToolResult
 from agentos.paths import state_dir as default_state_dir
 
@@ -145,6 +145,9 @@ class MCPStreamableHTTPClient(MCPClient):
     async def connect(self) -> None:
         if not self.config.url:
             raise ValueError("Streamable HTTP MCP server requires a URL")
+        # Checked here as well as inside ``mcp_http_client`` so an unusable URL
+        # fails before the OAuth provider is built from it.
+        assert_supported_mcp_url(self.config.url)
 
         try:
             from mcp.client.auth import OAuthClientProvider
@@ -178,11 +181,11 @@ class MCPStreamableHTTPClient(MCPClient):
         stack = AsyncExitStack()
         try:
             http_client = await stack.enter_async_context(
-                httpx.AsyncClient(
+                mcp_http_client(
+                    self.config.url,
                     auth=auth,
                     headers=self.config.headers,
                     timeout=httpx.Timeout(self.config.tool_timeout_seconds),
-                    trust_env=_trust_env(),
                 )
             )
             read_stream, write_stream, _ = await stack.enter_async_context(

@@ -141,3 +141,27 @@ def test_effective_workdir_rejects_foreign_posix_absolute_path_on_windows(
             shell._effective_workdir("/Users/a1/Desktop")
     finally:
         current_tool_context.reset(token)
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "rm /tmp/ok; cat /root/.bash_history",
+        "rm /tmp/ok; ls /root",
+        "rm /tmp/ok && rm -rf /root",
+        "rm /tmp/ok | cat ~/.ssh/id_rsa",
+    ],
+)
+def test_a_benign_first_segment_does_not_smuggle_a_sensitive_second_one(
+    command: str,
+) -> None:
+    """Issue #676: chaining past the block.
+
+    The delete-intent scan only reads ``rm`` targets, so the later segment is
+    caught by the whole-command text scan instead — either way ``exec_command``
+    refuses the command rather than running half of it.
+    """
+    payload = shell._sensitive_shell_block("exec_command", command)
+
+    assert payload is not None, command
+    assert json.loads(payload)["reason"] == "sensitive_path"

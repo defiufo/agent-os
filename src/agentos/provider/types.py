@@ -56,6 +56,7 @@ class ToolUseEndEvent:
     tool_name: str = ""
     arguments: dict[str, Any] = field(default_factory=dict)
     synthetic_from_text: bool = False
+    thought_signature: str | None = None
 
 
 @dataclass
@@ -233,6 +234,7 @@ class ContentBlockToolUse(BaseModel):
     id: str
     name: str
     input: dict[str, Any]
+    thought_signature: str | None = None
 
 
 class ContentBlockToolResult(BaseModel):

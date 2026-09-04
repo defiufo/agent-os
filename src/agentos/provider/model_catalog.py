@@ -48,6 +48,47 @@ def _catalog_price_per_1k(value: object) -> float:
     return price_per_million / 1000
 
 
+# Offline capability fallbacks for the Surplus marketplace, taken from the
+# families its published catalog marks with `reasoning` / `vision` in
+# supported_features. Only consulted when a boot could not reach the catalog;
+# a live fetch always wins.
+_SURPLUS_REASONING_PREFIXES = (
+    "claude-opus-",
+    "claude-sonnet-",
+    "deepseek-",
+    "gemini-",
+    "glm-5",
+    "gpt-5",
+    "grok-4",
+    "kimi-k",
+    "minimax-m2",
+    "qwen3",
+)
+_SURPLUS_VISION_PREFIXES = (
+    "claude-haiku-4.5",
+    "gemini-",
+    "glm-5.3-flash",
+    "glm-5v",
+    "gpt-5.6-",
+    "grok-4.5",
+    "grok-4.6",
+    "kimi-k2.6",
+    "kimi-k3",
+    "qwen3-vl",
+)
+
+
+def _catalog_price_per_token(value: object) -> float:
+    """Convert a validated catalog USD-per-token value to USD per 1K tokens."""
+    try:
+        price_per_token = float(cast(Any, value))
+    except (TypeError, ValueError):
+        return 0.0
+    if not isfinite(price_per_token) or price_per_token < 0:
+        return 0.0
+    return price_per_token * 1000
+
+
 class ModelCatalog:
     """In-memory cache of model metadata fetched from provider API.
 
@@ -74,8 +115,23 @@ class ModelCatalog:
             if not provider or model.provider.strip().lower() == provider
         ]
 
-    def _populate_from_data(self, models: list[dict]) -> None:
-        """Parse a list of OpenRouter model dicts into ModelInfo entries."""
+    def _populate_from_data(
+        self,
+        models: list[dict],
+        *,
+        provider_id: str = "openrouter",
+        pricing_per_token: bool = False,
+    ) -> None:
+        """Parse a list of OpenRouter-shaped model dicts into ModelInfo entries.
+
+        Surplus Intelligence publishes this same shape rather than the flatter
+        gateway one, so it reuses this parser. Two things differ and are opted
+        into rather than assumed: its ``pricing`` rates are USD **per token**
+        (OpenRouter's live pricing is resolved separately, in engine.pricing),
+        and it carries an extra ``supported_features`` array that names
+        ``vision`` / ``reasoning`` / ``tools`` directly instead of leaving them
+        to be inferred from ``supported_parameters``.
+        """
         for m in models:
             model_id = m.get("id", "")
             if not model_id:
@@ -83,20 +139,40 @@ class ModelCatalog:
             top_provider = m.get("top_provider") or {}
             max_completion = top_provider.get("max_completion_tokens") or 0
             supported = set(m.get("supported_parameters", []))
+            features = {str(item).lower() for item in m.get("supported_features", [])}
             architecture = m.get("architecture") or {}
             input_modalities = {
                 str(item).lower() for item in architecture.get("input_modalities", [])
             }
+            pricing = m.get("pricing") if pricing_per_token else None
+            if not isinstance(pricing, dict):
+                pricing = {}
             self._models[model_id] = ModelInfo(
-                provider="openrouter",
+                provider=provider_id,
                 model_id=model_id,
                 display_name=m.get("name", model_id),
                 context_window=m.get("context_length", 0),
                 max_output_tokens=max_completion,
-                supports_reasoning="reasoning" in supported or "reasoning_effort" in supported,
-                supports_tools="tools" in supported or "tool_choice" in supported,
-                supports_vision="image" in input_modalities,
+                supports_reasoning=(
+                    "reasoning" in supported
+                    or "reasoning_effort" in supported
+                    or "reasoning" in features
+                ),
+                supports_tools=(
+                    "tools" in supported or "tool_choice" in supported or "tools" in features
+                ),
+                supports_vision="image" in input_modalities or "vision" in features,
+                input_cost_per_1k=_catalog_price_per_token(pricing.get("prompt")),
+                output_cost_per_1k=_catalog_price_per_token(pricing.get("completion")),
             )
+
+    def _populate_from_surplus(self, models: list[dict]) -> None:
+        """Parse Surplus Intelligence marketplace model dicts into ModelInfo entries."""
+        self._populate_from_data(
+            models,
+            provider_id="surplus",
+            pricing_per_token=True,
+        )
 
     def _populate_from_gateway(
         self,
@@ -213,30 +289,89 @@ class ModelCatalog:
                 supports_tools=True,
                 reasoning_format="zai" if supports_reasoning else "none",
             )
+        if provider_id == "surplus":
+            # Surplus is an OpenRouter-shaped marketplace over bare ids. When
+            # its catalog has been fetched, the live-info branch above has
+            # already answered; this is the offline path, so the shipped tier
+            # defaults still route correctly on a boot whose catalog fetch
+            # failed. The format stays "openrouter" even for DeepSeek and GLM
+            # ids -- unlike the OpenCAP gateway, Surplus normalizes reasoning
+            # params and advertises `reasoning`/`include_reasoning` in
+            # supported_parameters for exactly these models, so sending a
+            # vendor-native switch instead would be the wrong shape.
+            supports_reasoning = (
+                info.supports_reasoning
+                if info is not None
+                else model_l.startswith(_SURPLUS_REASONING_PREFIXES)
+            )
+            return ModelCapabilities(
+                supports_reasoning=supports_reasoning,
+                supports_tools=info.supports_tools if info is not None else True,
+                supports_vision=(
+                    info.supports_vision
+                    if info is not None
+                    else model_l.startswith(_SURPLUS_VISION_PREFIXES)
+                ),
+                reasoning_format="openrouter" if supports_reasoning else "none",
+            )
         if provider_id in {"bankr", "opencap"}:
             # Gateway catalog ids are bare (e.g. "minimax-m3"); legacy Bankr
             # configs may still carry the namespaced "virtuals/<id>" form, so
             # strip the prefix before matching. Prefer live catalog modality data
             # when a fetch populated it; otherwise fall back to a prefix heuristic
-            # (gpt-5.5 has image input but gpt-5.4-mini does not).
+            # (gpt-5.5 has image input but gpt-5.4-mini does not). The glm entry
+            # is the flash line only: OpenCAP publishes glm-5.3-flash as natively
+            # multimodal while glm-5.2/glm-5.3 stay text-in, text-out.
             basename = model_l.split("/", 1)[1] if "/" in model_l else model_l
             supports_vision = (
                 info.supports_vision
                 if info is not None
                 else basename.startswith(
-                    ("minimax-m3", "gemini-", "kimi-", "claude-", "grok-", "gpt-5.5")
+                    (
+                        "minimax-m3",
+                        "gemini-",
+                        "kimi-",
+                        "claude-",
+                        "grok-",
+                        "gpt-5.5",
+                        "gpt-5.6",
+                        "glm-5.3-flash",
+                        "muse-spark-",
+                    )
                 )
             )
             # DeepSeek V4 through these gateways honors the DeepSeek-native
             # thinking payload and streams reasoning_content deltas (verified
             # live against OpenCAP). Without this, tier thinking_level settings
             # silently no-op for gateway DeepSeek routes.
-            supports_reasoning = basename.startswith("deepseek-v4")
+            if basename.startswith("deepseek-v4"):
+                return ModelCapabilities(
+                    supports_reasoning=True,
+                    supports_tools=True,
+                    supports_vision=supports_vision,
+                    reasoning_format="deepseek",
+                )
+            # GLM 5.x is OpenCAP's c2 default and reasons by default, emitting
+            # reasoning_content whether or not it is asked to. The gateway
+            # accepts Z.ai's own {"thinking": {"type": ...}} switch for it in
+            # both positions (verified live against OpenCAP), so declaring the
+            # format is what turns a tier's thinking_level from a no-op into a
+            # real control. Scoped to opencap: the Bankr gateway serves an
+            # overlapping catalog on a separate deployment that has not been
+            # verified to accept the same switch, and guessing wrong there sends
+            # a rejected parameter on every turn.
+            if provider_id == "opencap" and basename.startswith("glm-5"):
+                return ModelCapabilities(
+                    supports_reasoning=True,
+                    supports_tools=True,
+                    supports_vision=supports_vision,
+                    reasoning_format="zai",
+                )
             return ModelCapabilities(
-                supports_reasoning=supports_reasoning,
+                supports_reasoning=False,
                 supports_tools=True,
                 supports_vision=supports_vision,
-                reasoning_format="deepseek" if supports_reasoning else "none",
+                reasoning_format="none",
             )
         if provider_id == "dashscope":
             supports_reasoning = model_l.startswith(
@@ -343,6 +478,26 @@ class ModelCatalog:
 
         self._populate_from_opencap(data.get("data", []))
         log.debug("model_catalog.fetched_opencap", count=len(self._models))
+        return data
+
+    async def fetch_surplus(self, proxy: str = "") -> dict[str, Any]:
+        """Fetch Surplus Intelligence's public, unauthenticated live catalog."""
+        url = get_provider_spec("surplus").model_catalog_url
+        if not url:
+            raise RuntimeError("Surplus model catalog URL is not configured")
+        async with httpx.AsyncClient(
+            timeout=10.0, trust_env=_trust_env(), proxy=proxy or None
+        ) as client:
+            resp = await client.get(url, headers={"Accept": "application/json"})
+            resp.raise_for_status()
+            payload = resp.json()
+
+        if not isinstance(payload, dict):
+            raise ValueError("Surplus model catalog response must be a JSON object")
+        data = cast(dict[str, Any], payload)
+
+        self._populate_from_surplus(data.get("data", []))
+        log.debug("model_catalog.fetched_surplus", count=len(self._models))
         return data
 
     def get(self, model_id: str) -> ModelInfo | None:

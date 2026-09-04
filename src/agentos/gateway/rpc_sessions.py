@@ -1517,9 +1517,22 @@ async def _handle_sessions_patch(params: dict | None, ctx: RpcContext) -> dict:
             update_values[attr] = value
             updated_fields.append(field)
 
-    # Project moves route through the manager's validation choke point
-    # (project must exist and belong to the session's agent). An explicit
-    # null detaches; an absent field is untouched.
+    if update_values:
+        update = getattr(ctx.session_manager, "update", None)
+        if update is not None:
+            await update(key, **update_values)
+        else:
+            for attr, value in update_values.items():
+                setattr(session, attr, value)
+            upsert = getattr(storage, "upsert_session", None)
+            if upsert is not None:
+                await upsert(session)
+
+    # Project moves route through the manager's validation choke point (the
+    # project must exist; membership is cross-agent). An explicit null
+    # detaches; an absent field is untouched. Runs after the generic field
+    # update: that path may upsert the ``session`` snapshot read before this
+    # handler ran, which would silently revert a project move applied first.
     if "projectId" in params or "project_id" in params:
         raw_project = params.get("projectId", params.get("project_id"))
         if raw_project is not None and not isinstance(raw_project, str):
@@ -1545,17 +1558,11 @@ async def _handle_sessions_patch(params: dict | None, ctx: RpcContext) -> dict:
             "sessions.changed",
             build_sessions_changed_payload(key, "project_moved", project_id=raw_project),
         )
+        # Project lists show per-project session counts; a move changes them
+        # even though no projects.* CRUD ran.
+        from agentos.gateway.rpc_projects import _broadcast_projects_changed
 
-    if update_values:
-        update = getattr(ctx.session_manager, "update", None)
-        if update is not None:
-            await update(key, **update_values)
-        else:
-            for attr, value in update_values.items():
-                setattr(session, attr, value)
-            upsert = getattr(storage, "upsert_session", None)
-            if upsert is not None:
-                await upsert(session)
+        await _broadcast_projects_changed("session_moved", raw_project)
 
     return {"key": key, "updated": updated_fields}
 

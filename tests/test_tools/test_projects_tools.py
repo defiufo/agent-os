@@ -39,9 +39,7 @@ async def manager(storage):
 
 
 def _set_ctx(session_key: str | None, agent_id: str = "main"):
-    return current_tool_context.set(
-        ToolContext(session_key=session_key, agent_id=agent_id)
-    )
+    return current_tool_context.set(ToolContext(session_key=session_key, agent_id=agent_id))
 
 
 @pytest.mark.asyncio
@@ -57,9 +55,7 @@ async def test_projects_create_defaults_agent_from_context(manager):
 
 @pytest.mark.asyncio
 async def test_projects_list_returns_counts(manager):
-    project = json.loads(
-        await projects_tool.projects_create(name="Research", agent_id="main")
-    )
+    project = json.loads(await projects_tool.projects_create(name="Research", agent_id="main"))
     await manager.create(SESSION_KEY, agent_id="main", project_id=project["project_id"])
 
     rows = json.loads(await projects_tool.projects_list())
@@ -67,29 +63,59 @@ async def test_projects_list_returns_counts(manager):
 
 
 @pytest.mark.asyncio
-async def test_projects_update_replaces_knowledge(manager):
+async def test_projects_update_replaces_knowledge_of_own_project(manager):
     project = json.loads(
         await projects_tool.projects_create(name="Research", agent_id="main", knowledge="v1")
     )
-    data = json.loads(
-        await projects_tool.projects_update(
-            project_id=project["project_id"], knowledge="v2"
+    await manager.create(SESSION_KEY, agent_id="main", project_id=project["project_id"])
+
+    token = _set_ctx(SESSION_KEY)
+    try:
+        data = json.loads(
+            await projects_tool.projects_update(project_id=project["project_id"], knowledge="v2")
         )
-    )
+    finally:
+        current_tool_context.reset(token)
     assert data["knowledge"] == "v2"
 
 
 @pytest.mark.asyncio
-async def test_projects_update_unknown_project_is_tool_error(manager):
-    with pytest.raises(ToolError, match="not found"):
+async def test_projects_update_foreign_project_is_denied(manager):
+    """A session in project A must not be able to write project B's knowledge."""
+    own = json.loads(await projects_tool.projects_create(name="Own", agent_id="main"))
+    other = json.loads(await projects_tool.projects_create(name="Other", agent_id="main"))
+    await manager.create(SESSION_KEY, agent_id="main", project_id=own["project_id"])
+
+    token = _set_ctx(SESSION_KEY)
+    try:
+        with pytest.raises(ToolError, match="calling session"):
+            await projects_tool.projects_update(
+                project_id=other["project_id"], knowledge="injected"
+            )
+    finally:
+        current_tool_context.reset(token)
+
+
+@pytest.mark.asyncio
+async def test_projects_update_outside_any_project_is_denied(manager):
+    """Sessions without a project (or without context) get the scoping error,
+    not an existence oracle for foreign project ids."""
+    await manager.create(SESSION_KEY, agent_id="main")
+
+    token = _set_ctx(SESSION_KEY)
+    try:
+        with pytest.raises(ToolError, match="calling session"):
+            await projects_tool.projects_update(project_id="missing", knowledge="v2")
+    finally:
+        current_tool_context.reset(token)
+
+    with pytest.raises(ToolError, match="calling session"):
         await projects_tool.projects_update(project_id="missing", knowledge="v2")
 
 
 @pytest.mark.asyncio
 async def test_projects_move_session_defaults_to_calling_session(manager):
-    project = json.loads(
-        await projects_tool.projects_create(name="Research", agent_id="main")
-    )
+    project = json.loads(await projects_tool.projects_create(name="Research", agent_id="main"))
     await manager.create(SESSION_KEY, agent_id="main")
 
     token = _set_ctx(SESSION_KEY)
@@ -111,9 +137,54 @@ async def test_projects_move_session_defaults_to_calling_session(manager):
 
 
 @pytest.mark.asyncio
-async def test_projects_move_session_without_context_requires_key(manager):
-    with pytest.raises(ToolError, match="session_key is required"):
+async def test_projects_move_session_without_context_is_denied(manager):
+    with pytest.raises(ToolError, match="requires a calling session"):
         await projects_tool.projects_move_session(project_id="whatever")
+
+
+@pytest.mark.asyncio
+async def test_projects_move_session_foreign_session_is_denied(manager):
+    """Only the calling session may be moved — a foreign key would hand the
+    project's knowledge to another session's system prompt."""
+    project = json.loads(await projects_tool.projects_create(name="Research", agent_id="main"))
+    await manager.create(SESSION_KEY, agent_id="main")
+    victim = await manager.create("agent:main:webchat:cafe0009", agent_id="main")
+
+    token = _set_ctx(SESSION_KEY)
+    try:
+        with pytest.raises(ToolError, match="only move the calling session"):
+            await projects_tool.projects_move_session(
+                project_id=project["project_id"], session_key=victim.session_key
+            )
+    finally:
+        current_tool_context.reset(token)
+    moved = await manager.get_session(victim.session_key)
+    assert moved.project_id is None
+
+
+@pytest.mark.asyncio
+async def test_projects_list_hides_foreign_knowledge(manager):
+    """Knowledge text is returned only for the calling session's own project."""
+    own = json.loads(
+        await projects_tool.projects_create(name="Own", agent_id="main", knowledge="mine")
+    )
+    json.loads(
+        await projects_tool.projects_create(name="Other", agent_id="main", knowledge="theirs")
+    )
+    await manager.create(SESSION_KEY, agent_id="main", project_id=own["project_id"])
+
+    token = _set_ctx(SESSION_KEY)
+    try:
+        rows = json.loads(await projects_tool.projects_list())
+    finally:
+        current_tool_context.reset(token)
+    by_name = {row["name"]: row for row in rows}
+    assert by_name["Own"]["knowledge"] == "mine"
+    assert "knowledge" not in by_name["Other"]
+
+    # Without any calling session, no knowledge is exposed at all.
+    rows = json.loads(await projects_tool.projects_list())
+    assert all("knowledge" not in row for row in rows)
 
 
 @pytest.mark.asyncio
@@ -124,9 +195,7 @@ async def test_session_search_project_scope(manager, storage):
     assert registered is not None
     search = registered.handler
 
-    project = json.loads(
-        await projects_tool.projects_create(name="Research", agent_id="main")
-    )
+    project = json.loads(await projects_tool.projects_create(name="Research", agent_id="main"))
     inside = await manager.create(SESSION_KEY, agent_id="main", project_id=project["project_id"])
     outside = await manager.create("agent:main:webchat:cafe0002", agent_id="main")
     await manager.append_message(inside.session_key, role="user", content="quantum widget alpha")

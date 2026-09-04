@@ -229,7 +229,8 @@
 
 .chat-surface .msg-artifact-gallery,
 .chat-surface .msg-artifact-files,
-.chat-surface .msg-artifact-charts {
+.chat-surface .msg-artifact-charts,
+.chat-surface .msg-artifact-cards-group {
   display: grid;
   gap: 0.625rem;
 }
@@ -364,6 +365,209 @@
 }
 
 .chat-surface .msg-artifact-chart__status[hidden] {
+  display: none;
+}
+
+/* Card-grid artifacts (cards.ts). A skill publishes a set of small records —
+   a token lookup, a holder list — and this renders them as a responsive grid
+   instead of a markdown table, which long values (contract addresses) would
+   force into a horizontal scroll. */
+.chat-surface .msg-artifact-cards-group {
+  max-width: 100%;
+}
+
+.chat-surface .msg-artifact-cards {
+  display: grid;
+  gap: 0.5rem;
+  width: 100%;
+  padding: 0.75rem;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-surface);
+  background: color-mix(in srgb, var(--card) 92%, transparent);
+  color: var(--foreground);
+}
+
+.chat-surface .msg-artifact-cards__header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.75rem;
+  min-width: 0;
+}
+
+.chat-surface .msg-artifact-cards__name {
+  overflow: hidden;
+  font-size: 0.8125rem;
+  font-weight: 600;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* auto-fill rather than auto-fit: a single card should keep its natural width
+   instead of stretching across the whole transcript column. */
+.chat-surface .msg-artifact-cards__grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(min(15rem, 100%), 1fr));
+  gap: 0.5rem;
+}
+
+.chat-surface .msg-artifact-cards__card {
+  display: grid;
+  gap: 0.4375rem;
+  align-content: start;
+  min-width: 0;
+  padding: 0.625rem;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-control);
+  background: var(--background);
+}
+
+.chat-surface .msg-artifact-cards__head {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  min-width: 0;
+}
+
+.chat-surface .msg-artifact-cards__logo,
+.chat-surface .msg-artifact-cards__mark {
+  flex-shrink: 0;
+  width: 1.75rem;
+  height: 1.75rem;
+  border-radius: 50%;
+  background: var(--card);
+  object-fit: contain;
+}
+
+/* Ticker monogram — the default mark. See cards.ts for why a remote logo is
+   not fetched. */
+.chat-surface .msg-artifact-cards__mark {
+  display: grid;
+  place-items: center;
+  border: 1px solid var(--border);
+  color: var(--muted-foreground);
+  font-family: var(--font-mono);
+  font-size: 0.625rem;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+}
+
+.chat-surface .msg-artifact-cards__heading {
+  display: grid;
+  gap: 0.0625rem;
+  min-width: 0;
+}
+
+.chat-surface .msg-artifact-cards__title,
+.chat-surface .msg-artifact-cards__subtitle {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.chat-surface .msg-artifact-cards__title {
+  font-size: 0.8125rem;
+  font-weight: 600;
+}
+
+.chat-surface .msg-artifact-cards__subtitle {
+  color: var(--muted-foreground);
+  font-size: 0.6875rem;
+}
+
+.chat-surface .msg-artifact-cards__badge {
+  justify-self: start;
+  padding: 0.0625rem 0.4375rem;
+  border: 1px solid transparent;
+  border-radius: var(--radius-pill);
+  font-family: var(--font-mono);
+  font-size: 0.625rem;
+  line-height: 1.5;
+}
+
+/* Tone drives colour only. cards.ts falls back to `neutral` for any tone it
+   does not know, so a skill can ship a new status without a frontend release. */
+.chat-surface .msg-artifact-cards__badge[data-tone='positive'] {
+  border-color: color-mix(in srgb, var(--success, #2ea043) 45%, transparent);
+  background: color-mix(in srgb, var(--success, #2ea043) 16%, transparent);
+  color: var(--success, #2ea043);
+}
+
+.chat-surface .msg-artifact-cards__badge[data-tone='warning'] {
+  border-color: color-mix(in srgb, var(--warning, #d29922) 45%, transparent);
+  background: color-mix(in srgb, var(--warning, #d29922) 16%, transparent);
+  color: var(--warning, #d29922);
+}
+
+.chat-surface .msg-artifact-cards__badge[data-tone='danger'] {
+  border-color: color-mix(in srgb, var(--destructive, #f85149) 45%, transparent);
+  background: color-mix(in srgb, var(--destructive, #f85149) 16%, transparent);
+  color: var(--destructive, #f85149);
+}
+
+.chat-surface .msg-artifact-cards__badge[data-tone='neutral'] {
+  border-color: var(--border);
+  background: color-mix(in srgb, var(--foreground) 6%, transparent);
+  color: var(--muted-foreground);
+}
+
+.chat-surface .msg-artifact-cards__fields {
+  display: grid;
+  gap: 0.1875rem;
+  min-width: 0;
+}
+
+.chat-surface .msg-artifact-cards__field {
+  display: flex;
+  align-items: baseline;
+  gap: 0.375rem;
+  min-width: 0;
+}
+
+.chat-surface .msg-artifact-cards__field-label {
+  flex-shrink: 0;
+  color: var(--muted-foreground);
+  font-size: 0.6875rem;
+}
+
+.chat-surface .msg-artifact-cards__field-value {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  font-size: 0.6875rem;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.chat-surface .msg-artifact-cards__field-value--mono {
+  font-family: var(--font-mono);
+}
+
+.chat-surface .msg-artifact-cards__copy {
+  flex-shrink: 0;
+  padding: 0;
+  border: none;
+  background: none;
+  color: var(--muted-foreground);
+  font-size: 0.75rem;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.chat-surface .msg-artifact-cards__copy:hover {
+  color: var(--foreground);
+}
+
+.chat-surface .msg-artifact-cards__overflow,
+.chat-surface .msg-artifact-cards__status {
+  margin: 0;
+  color: var(--muted-foreground);
+  font-family: var(--font-mono);
+  font-size: 0.6875rem;
+}
+
+.chat-surface .msg-artifact-cards__overflow[hidden],
+.chat-surface .msg-artifact-cards__status[hidden] {
   display: none;
 }
 

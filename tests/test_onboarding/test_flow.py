@@ -139,6 +139,7 @@ def test_interactive_provider_choice_offers_only_verified_supported_providers():
     assert offered == {
         "bankr",
         "opencap",
+        "surplus",
         "openrouter",
         "openai",
         "anthropic",

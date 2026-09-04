@@ -6,6 +6,7 @@ import hashlib
 import json
 import mimetypes
 import os
+import re
 from difflib import SequenceMatcher
 from pathlib import Path
 
@@ -297,3 +298,80 @@ async def publish_artifact(
         },
         ensure_ascii=False,
     )
+
+
+# ── Inline artifacts announced on stdout ────────────────────────────────────
+#
+# A skill script that produces an inline-rendered payload (a chart, a card grid)
+# ends by printing a marker naming the file it wrote. Publishing used to be left
+# to the model: it had to notice the marker and choose to call publish_artifact.
+# In practice it frequently did not -- the lookup ran, the file was written, and
+# the answer came back as a hand-written markdown table with the artifact
+# stranded in the workspace. The rendering only ever fired when the model felt
+# like it, which is not a contract.
+#
+# exec_command now honours the marker itself, so a skill that writes the file
+# gets the render. The model stays in charge of the *prose*; it is no longer in
+# charge of whether the UI draws.
+
+#: The marker a skill script prints, alone on its own line.
+INLINE_ARTIFACT_MARKER_RE = re.compile(
+    r"^publish_artifact[ \t]+path=(?P<path>\S+)[ \t]+mime=(?P<mime>\S+)[ \t]*$",
+    re.MULTILINE,
+)
+
+#: Only AgentOS's own inline-render mimes auto-publish. A plain file (a report, a
+#: zip) still requires a deliberate publish_artifact call, so stray output that
+#: happens to look like the marker cannot push arbitrary workspace files at the
+#: user. Path containment is enforced by publish_artifact itself.
+INLINE_ARTIFACT_MIME_PREFIX = "application/vnd.agentos."
+
+_MAX_INLINE_ARTIFACTS_PER_CALL = 4
+
+
+async def publish_inline_artifacts(output: str) -> str:
+    """Publish inline artifacts announced in ``output`` and replace the markers.
+
+    Best-effort by construction: a shell command must never fail, or have its
+    output withheld, because a publish did not work out. Anything that goes
+    wrong is reported in place of the marker and the command's own output is
+    returned untouched otherwise.
+    """
+    if not output or "publish_artifact" not in output:
+        return output
+    ctx = current_tool_context.get()
+    if ctx is None or not ctx.workspace_dir:
+        return output
+
+    matches = list(INLINE_ARTIFACT_MARKER_RE.finditer(output))
+    if not matches:
+        return output
+
+    replacements: dict[str, str] = {}
+    published = 0
+    for match in matches:
+        marker = match.group(0)
+        if marker in replacements:
+            continue
+        mime = match.group("mime")
+        if not mime.startswith(INLINE_ARTIFACT_MIME_PREFIX):
+            # Not an inline-render mime: leave the marker alone so the model can
+            # still publish it deliberately if that is what the skill wants.
+            continue
+        if published >= _MAX_INLINE_ARTIFACTS_PER_CALL:
+            replacements[marker] = "[inline artifact skipped: too many in one command]"
+            continue
+        try:
+            await publish_artifact(path=match.group("path"), mime=mime)
+        except ToolError as exc:
+            replacements[marker] = f"[inline artifact not published: {exc}]"
+            continue
+        published += 1
+        replacements[marker] = (
+            "[inline artifact published and already rendered for the user: "
+            f"{match.group('path')}. Do not call publish_artifact for it.]"
+        )
+
+    for marker, note in replacements.items():
+        output = output.replace(marker, note)
+    return output

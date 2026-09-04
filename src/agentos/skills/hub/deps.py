@@ -121,12 +121,11 @@ async def _fetch_to_file(url: str, dest: Path) -> None:
     one at a time with the same guard applied to each, mirroring
     :mod:`agentos.tools.builtin.web_fetch`.
     """
-    import httpx
-
     from agentos.tools.ssrf import validate_http_url_for_fetch
+    from agentos.tools.ssrf_client import ssrf_guarded_client
 
     current_url = url
-    async with httpx.AsyncClient(timeout=120.0, follow_redirects=False) as client:
+    async with ssrf_guarded_client(timeout=120.0, follow_redirects=False) as client:
         for _hop in range(_MAX_DOWNLOAD_REDIRECTS + 1):
             validate_http_url_for_fetch(current_url)
             request = client.build_request("GET", current_url)

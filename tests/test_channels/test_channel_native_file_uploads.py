@@ -11,8 +11,11 @@ from agentos.channels.telegram import TelegramChannel, TelegramChannelConfig
 
 
 class _FakeResponse:
-    def __init__(self, payload: dict[str, Any] | None = None) -> None:
+    def __init__(self, payload: dict[str, Any] | None = None, status_code: int = 200) -> None:
         self._payload = payload or {"ok": True}
+        # Slack's outbound calls go through ``retry_request``, which reads the
+        # status before returning the response.
+        self.status_code = status_code
 
     def raise_for_status(self) -> None:
         return None

@@ -83,6 +83,7 @@ def _provider_display_name(provider_kind: str) -> str:
         "openai": "OpenAI",
         "openrouter": "OpenRouter",
         "opencap": "OpenCAP",
+        "surplus": "Surplus Intelligence",
         "deepseek": "DeepSeek",
         "moonshot": "Moonshot",
         "dashscope": "DashScope",
@@ -90,6 +91,19 @@ def _provider_display_name(provider_kind: str) -> str:
         "zhipu": "Zhipu",
         "qianfan": "Qianfan",
         "volcengine": "Volcengine",
+        "azure": "Azure OpenAI",
+        "bailian_coding": "Bailian Coding",
+        "mistral": "Mistral",
+        "groq": "Groq",
+        "siliconflow": "SiliconFlow",
+        "aihubmix": "AIHubMix",
+        "minimax": "MiniMax",
+        "minimax_openai": "MiniMax",
+        "byteplus": "BytePlus",
+        "bankr": "Bankr",
+        "vllm": "vLLM",
+        "lm_studio": "LM Studio",
+        "ovms": "OVMS",
     }.get(provider_kind, "Provider")
 
 
@@ -275,6 +289,22 @@ def _parse_plain_json_tool_call(text: str) -> tuple[str, dict[str, Any]] | None:
     if exact_call is not None:
         return exact_call
     return _parse_trailing_plain_json_tool_call(text)
+
+
+def _extract_thought_signature(tc: Mapping[str, Any]) -> str | None:
+    raw_fn = tc.get("function")
+    function: Mapping[str, Any] = raw_fn if isinstance(raw_fn, Mapping) else {}
+    raw_extra = tc.get("extra_content")
+    extra_content: Mapping[str, Any] = raw_extra if isinstance(raw_extra, Mapping) else {}
+    sig = (
+        tc.get("thought_signature")
+        or tc.get("thoughtSignature")
+        or function.get("thought_signature")
+        or function.get("thoughtSignature")
+        or extra_content.get("thought_signature")
+        or extra_content.get("thoughtSignature")
+    )
+    return str(sig) if sig else None
 
 
 def _coerce_int(value: Any) -> int:
@@ -541,6 +571,7 @@ def _build_openai_messages(
     *,
     include_reasoning_content: bool = True,
     require_assistant_reasoning_content: bool = False,
+    provider_kind: str | None = None,
 ) -> list[dict[str, Any]]:
     """Convert a agentos Message into one or more OpenAI-format message dicts.
 
@@ -569,16 +600,20 @@ def _build_openai_messages(
         if block.type == "text":
             parts.append({"type": "text", "text": block.text})
         elif block.type == "tool_use":
-            tool_calls.append(
-                {
-                    "id": block.id,
-                    "type": "function",
-                    "function": {
-                        "name": block.name,
-                        "arguments": json.dumps(block.input),
-                    },
-                }
-            )
+            tool_call_dict: dict[str, Any] = {
+                "id": block.id,
+                "type": "function",
+                "function": {
+                    "name": block.name,
+                    "arguments": json.dumps(block.input),
+                },
+            }
+            thought_sig = getattr(block, "thought_signature", None)
+            if thought_sig:
+                tool_call_dict["thought_signature"] = thought_sig
+            elif provider_kind == "gemini":
+                tool_call_dict["thought_signature"] = "skip_thought_signature_validator"
+            tool_calls.append(tool_call_dict)
         elif block.type == "image":
             if block.source_type == "url":
                 parts.append({"type": "image_url", "image_url": {"url": block.data}})
@@ -751,6 +786,7 @@ class OpenAIProvider:
                     require_assistant_reasoning_content=(
                         _is_direct_deepseek_v4_request(self._provider_kind, self._model)
                     ),
+                    provider_kind=self._provider_kind,
                 )
             )
 
@@ -797,7 +833,7 @@ class OpenAIProvider:
                     "order": [pinned_provider],
                     "allow_fallbacks": True,
                 }
-            elif self._provider_kind == "opencap":
+            elif self._provider_kind in {"opencap", "surplus"}:
                 payload["provider"] = [pinned_provider]
 
         # Reasoning injection (gated on thinking being enabled)
@@ -813,9 +849,7 @@ class OpenAIProvider:
                 payload["reasoning_effort"] = effort
             elif reasoning_format == "deepseek":
                 payload["thinking"] = {"type": "enabled"}
-                payload["reasoning_effort"] = _resolve_deepseek_reasoning_effort(
-                    cfg.thinking_level
-                )
+                payload["reasoning_effort"] = _resolve_deepseek_reasoning_effort(cfg.thinking_level)
             elif reasoning_format == "gemini":
                 payload["reasoning_effort"] = effort
             elif reasoning_format == "zai":
@@ -840,10 +874,15 @@ class OpenAIProvider:
             payload["thinking"] = {"type": "disabled"}
         elif caps and caps.supports_reasoning and caps.reasoning_format == "dashscope":
             payload["enable_thinking"] = False
-        elif caps and caps.supports_reasoning and caps.reasoning_format in {
-            "moonshot",
-            "volcengine",
-        }:
+        elif (
+            caps
+            and caps.supports_reasoning
+            and caps.reasoning_format
+            in {
+                "moonshot",
+                "volcengine",
+            }
+        ):
             payload["thinking"] = {"type": "disabled"}
         elif (
             self._provider_kind == "openrouter"
@@ -899,6 +938,8 @@ class OpenAIProvider:
             "Content-Type": "application/json",
             "Accept": "text/event-stream",
         }
+        if self._provider_kind in {"opencap", "bankr", "surplus"}:
+            headers["x-api-key"] = self._api_key
         headers.update(openrouter_app_headers(self._base_url))
         if self._org_id:
             headers["OpenAI-Organization"] = self._org_id
@@ -983,11 +1024,13 @@ class OpenAIProvider:
                         # to keep memory low.
                         _body_text = (
                             body.decode("utf-8", errors="replace")
-                            if isinstance(body, bytes) else str(body)
+                            if isinstance(body, bytes)
+                            else str(body)
                         )
                         try:
                             _payload_head = json.dumps(
-                                payload, ensure_ascii=False,
+                                payload,
+                                ensure_ascii=False,
                             )[:4000]
                         except Exception:  # noqa: BLE001
                             _payload_head = repr(payload)[:4000]
@@ -1085,11 +1128,13 @@ class OpenAIProvider:
                                     provider_kind=self._provider_kind,
                                 )
                                 function = tc.get("function") or {}
+                                thought_sig = _extract_thought_signature(tc)
                                 if idx not in pending_calls:
                                     pending_calls[idx] = {
                                         "id": tc.get("id") or f"call_{uuid4().hex[:12]}",
                                         "name": function.get("name") or "",
                                         "parts": [],
+                                        "thought_signature": thought_sig,
                                     }
                                     emitted_stream_event = True
                                     yield ToolUseStartEvent(
@@ -1103,6 +1148,10 @@ class OpenAIProvider:
                                     fname = function.get("name") or ""
                                     if fname:
                                         pending_calls[idx]["name"] = fname
+                                    if thought_sig and not pending_calls[idx].get(
+                                        "thought_signature"
+                                    ):
+                                        pending_calls[idx]["thought_signature"] = thought_sig
 
                                 fragment = function.get("arguments") or ""
                                 if fragment:
@@ -1136,6 +1185,7 @@ class OpenAIProvider:
                             tool_use_id=call["id"],
                             tool_name=call["name"],
                             arguments=args,
+                            thought_signature=call.get("thought_signature"),
                         )
 
                     # Last-resort MiniMax compatibility: some OpenRouter
@@ -1294,6 +1344,7 @@ class OpenAIProvider:
                 tool_use_id = tc.get("id") or f"call_{uuid4().hex[:12]}"
                 tool_name = function.get("name") or ""
                 arguments_text = function.get("arguments") or ""
+                thought_sig = _extract_thought_signature(tc)
                 emitted_structured_tool = True
                 yield ToolUseStartEvent(tool_use_id=tool_use_id, tool_name=tool_name)
                 if arguments_text:
@@ -1309,6 +1360,7 @@ class OpenAIProvider:
                     tool_use_id=tool_use_id,
                     tool_name=tool_name,
                     arguments=arguments,
+                    thought_signature=thought_sig,
                 )
 
         if not emitted_structured_tool and tools and assistant_text_parts:
@@ -1338,6 +1390,8 @@ class OpenAIProvider:
 
     async def list_models(self) -> list[ModelInfo]:
         headers = {"Authorization": f"Bearer {self._api_key}"}
+        if self._provider_kind in {"opencap", "bankr", "surplus"}:
+            headers["x-api-key"] = self._api_key
         headers.update(openrouter_app_headers(self._base_url))
         try:
             async with httpx.AsyncClient(

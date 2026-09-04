@@ -158,6 +158,75 @@ def _msteams_spec() -> ChannelSetupSpec:
     )
 
 
+def _email_spec() -> ChannelSetupSpec:
+    return ChannelSetupSpec(
+        type="email",
+        label="Email",
+        description="Email via IMAP polling (inbound) and SMTP (outbound).",
+        transport="polling",
+        requires_public_url=False,
+        dependency_extra=None,
+        restart_required=True,
+        docs_hint="https://support.google.com/mail/answer/7126229",
+        help=(
+            "Needs no platform app registration - only IMAP and SMTP credentials. "
+            "allowed_senders is a fail-closed From-address allowlist: exact "
+            "addresses or domain patterns (*@example.com). One mail thread is one "
+            "session. Providers with 2FA usually require an app password."
+        ),
+        fields=(
+            *_common_fields(),
+            ChannelSetupField("imap_host", "IMAP host", "text", required=True,
+                              group="inbound", placeholder="imap.gmail.com"),
+            ChannelSetupField("imap_port", "IMAP port", "int", required=False,
+                              default=993, group="inbound"),
+            ChannelSetupField("imap_ssl", "IMAP SSL", "bool", required=False,
+                              default=True, group="inbound"),
+            ChannelSetupField("imap_username", "IMAP username", "text",
+                              required=True, group="inbound"),
+            ChannelSetupField("imap_password", "IMAP password", "password",
+                              required=True, secret=True, group="credentials"),
+            ChannelSetupField("imap_folder", "IMAP folder", "text", required=False,
+                              default="INBOX", group="inbound"),
+            ChannelSetupField("smtp_host", "SMTP host", "text", required=True,
+                              group="outbound", placeholder="smtp.gmail.com"),
+            ChannelSetupField("smtp_port", "SMTP port", "int", required=False,
+                              default=587, group="outbound"),
+            ChannelSetupField("smtp_ssl", "SMTP implicit TLS", "bool", required=False,
+                              default=False, group="outbound",
+                              description="Use SMTPS (usually port 465) instead of STARTTLS."),
+            ChannelSetupField("smtp_starttls", "SMTP STARTTLS", "bool", required=False,
+                              default=True, group="outbound"),
+            ChannelSetupField("smtp_username", "SMTP username", "text", required=False,
+                              default="", group="outbound",
+                              description="Defaults to unauthenticated relay when empty."),
+            ChannelSetupField("smtp_password", "SMTP password", "password",
+                              required=False, secret=True, default="",
+                              group="credentials"),
+            ChannelSetupField("from_address", "From address", "text", required=True,
+                              placeholder="agent@example.com"),
+            ChannelSetupField("from_name", "From display name", "text",
+                              required=False, default=""),
+            ChannelSetupField("allowed_senders", "Allowed senders", "text",
+                              required=True,
+                              description="Comma-separated From addresses or domain "
+                              "patterns (*@example.com). Mail from anyone else is "
+                              "dropped."),
+            ChannelSetupField("poll_interval_s", "Poll interval (s)", "float",
+                              required=False, default=30.0, group="polling"),
+            ChannelSetupField("max_messages_per_poll", "Max messages per poll", "int",
+                              required=False, default=10, group="polling"),
+            ChannelSetupField("max_message_bytes", "Max message bytes", "int",
+                              required=False, default=25 * 1024 * 1024,
+                              advanced=True, group="polling"),
+            ChannelSetupField("mark_seen", "Mark handled mail as seen", "bool",
+                              required=False, default=True, group="polling"),
+            ChannelSetupField("connect_timeout_s", "Connect timeout (s)", "float",
+                              required=False, default=30.0, advanced=True),
+        ),
+    )
+
+
 def _telegram_spec() -> ChannelSetupSpec:
     return ChannelSetupSpec(
         type="telegram",
@@ -219,6 +288,7 @@ def _telegram_spec() -> ChannelSetupSpec:
 
 _BUILDERS = {
     "discord": _discord_spec,
+    "email": _email_spec,
     # msteams is intentionally absent: the adapter is text-only and hidden
     # from runtime catalog surfaces until first-class support lands. The
     # _msteams_spec helper is retained for future restoration.

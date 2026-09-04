@@ -42,7 +42,9 @@ def within_window(ts_str: str, cutoff: datetime) -> bool:
 
 
 def aggregate_co_occurrences(
-    log_dir: Path, window_days: int, top_k: int,
+    log_dir: Path,
+    window_days: int,
+    top_k: int,
 ) -> list[dict]:
     """Return top-K most-frequent skill co-occurrence chains in the window.
 

@@ -27,7 +27,11 @@ Examples (with ``workspace_root = <configured-workspace>``):
   → tail ``papers/intro.tex`` → ``<configured-workspace>/papers/intro.tex``
 * ``/workspace/foo`` → ``<configured-workspace>/foo``
 * ``<configured-workspace>/x.tex`` (the real path)
-  → tail ``x.tex`` → identical resolved path (idempotent, harmless)
+  → already under the configured root, returned unchanged
+* ``<configured-workspace>/workspace/data.txt`` (a real nested dir)
+  → already under the configured root, returned unchanged. Without this
+  check the last-segment rewrite would strip the nested ``workspace/``
+  and hit ``<configured-workspace>/data.txt`` instead.
 * ``/etc/passwd`` — no ``workspace`` segment, ``None`` returned, the
   caller's pre-existing sensitive-path / workspace-strict checks run
   unchanged.
@@ -58,12 +62,21 @@ def resolve_workspace_alias(raw_path: PurePath, workspace_root: Path | None) -> 
       * ``raw_path`` has no path segment literally named ``workspace``.
 
     Otherwise returns ``workspace_root / <tail-after-last-workspace-segment>``
-    as a resolved ``strict=False`` Path. Idempotent for paths already
-    rooted at ``workspace_root``.
+    as a resolved ``strict=False`` Path. Paths already inside
+    ``workspace_root`` are returned unchanged so a real nested directory
+    named ``workspace`` is not stripped.
     """
 
     if workspace_root is None or not _is_rooted_path(raw_path):
         return None
+
+    try:
+        resolved_root = workspace_root.expanduser().resolve(strict=False)
+        resolved_raw = Path(raw_path).expanduser().resolve(strict=False)
+        if resolved_raw == resolved_root or resolved_raw.is_relative_to(resolved_root):
+            return resolved_raw
+    except (OSError, RuntimeError, ValueError):
+        pass
 
     parts = raw_path.parts
     # Use the rightmost workspace boundary so paths shaped like
@@ -76,5 +89,5 @@ def resolve_workspace_alias(raw_path: PurePath, workspace_root: Path | None) -> 
     if last_idx < 0:
         return None
 
-    tail_parts = parts[last_idx + 1:]
+    tail_parts = parts[last_idx + 1 :]
     return (workspace_root.joinpath(*tail_parts)).resolve(strict=False)

@@ -107,6 +107,7 @@ _SHELL_NAMES = (
 #   AGENTOS_SHELL_DENYLIST            tools/builtin/shell_policy.py
 #   AGENTOS_SAFE_BIN_ALLOW/DENY/WARN  tools/builtin/shell_policy.py
 #   AGENTOS_AGENT_PERMISSIONS         cli/agent_cmd.py
+#   AGENTOS_TRUST_ENV                 env.py (honour ambient *_PROXY at all)
 #   AGENTOS_HOOKS                     engine/runtime.py
 #   AGENTOS_GATEWAY_TOKEN             cli/gateway_rpc.py
 #   AGENTOS_GATEWAY_CONFIG_PATH       gateway config resolution
@@ -124,6 +125,7 @@ _AGENTOS_POSTURE_NAMES = (
     "AGENTOS_SAFE_BIN_DENY",
     "AGENTOS_SAFE_BIN_WARN",
     "AGENTOS_AGENT_PERMISSIONS",
+    "AGENTOS_TRUST_ENV",
     "AGENTOS_HOOKS",
     "AGENTOS_GATEWAY_TOKEN",
     "AGENTOS_GATEWAY_CONFIG_PATH",
@@ -136,18 +138,53 @@ _AGENTOS_POSTURE_NAMES = (
     "AGENTOS_GATEWAY_HOST",
     "AGENTOS_GATEWAY_PORT",
     "AGENTOS_LISTEN",
+    "AGENTOS_HTTP_DOWNLOAD_LIMIT",
 )
+
+# Group 5 — egress steering. A proxy name is a posture name: whoever sets it
+# chooses the machine every outbound request is handed to, credentials and all.
+# ``AGENTOS_LLM_PROXY`` is read at ``gateway/llm_runtime.py``,
+# ``provider/openai.py`` and ``provider/auxiliary.py`` and applied to every
+# provider client, so a writable value puts an attacker in front of each
+# ``Authorization: Bearer ...`` header. The standard ``*_PROXY`` names reach the
+# same place through ``trust_env`` on any subprocess or library that honours
+# them, and ``NO_PROXY`` belongs here too — carving a host out of the proxy is
+# as much a routing decision as adding one.
+#
+# Case is not a boundary here. ``agentos.env`` pushes ``.env`` keys into
+# ``os.environ`` verbatim, and the readers downstream lower-case whatever they
+# find — ``urllib.request.getproxies_environment()``, which httpx goes through,
+# treats ``Http_Proxy`` as ``http://`` just as readily as ``HTTP_PROXY``. So
+# these names are matched case-insensitively (``_EGRESS_UPPER`` below) rather
+# than by exact spelling; the two conventional spellings stay in
+# ``WRITE_DENYLIST`` so a plain membership test still sees them.
+_EGRESS_NAMES = (
+    "AGENTOS_LLM_PROXY",
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "ALL_PROXY",
+    "NO_PROXY",
+    "http_proxy",
+    "https_proxy",
+    "all_proxy",
+    "no_proxy",
+)
+
+#: Egress names upper-cased, for the case-insensitive comparison. Any spelling
+#: of these — ``Http_Proxy``, ``hTTp_PrOXy`` — is refused.
+_EGRESS_UPPER: frozenset[str] = frozenset(name.upper() for name in _EGRESS_NAMES)
 
 #: Names that may never be written through an AgentOS surface.
 WRITE_DENYLIST: frozenset[str] = frozenset(
-    _LOADER_NAMES + _INTERPRETER_NAMES + _SHELL_NAMES + _AGENTOS_POSTURE_NAMES
+    _LOADER_NAMES + _INTERPRETER_NAMES + _SHELL_NAMES + _AGENTOS_POSTURE_NAMES + _EGRESS_NAMES
 )
 
 _DENY_MESSAGE = (
     "Environment variable {key!r} cannot be written through AgentOS. Names that "
     "steer subprocess execution (PATH, LD_PRELOAD, PYTHONPATH, EDITOR, ...) or "
     "AgentOS runtime posture (AGENTOS_AGENT_PERMISSIONS, AGENTOS_GATEWAY_TOKEN, "
-    "...) are refused so this surface cannot escalate its own privileges. Edit "
+    "...) or outbound routing (HTTP_PROXY, AGENTOS_LLM_PROXY, ...) are refused "
+    "so this surface cannot escalate its own privileges. Edit "
     "~/.agentos/.env directly if you genuinely need to set it."
 )
 
@@ -165,15 +202,20 @@ def assert_valid_name(key: str) -> None:
         )
 
 
+def _is_denied(key: str) -> bool:
+    """Return whether *key* is on the denylist under either matching rule."""
+    return key in WRITE_DENYLIST or key.upper() in _EGRESS_UPPER
+
+
 def is_writable(key: str) -> bool:
     """Return whether *key* may be written through an AgentOS surface."""
-    return bool(ENV_NAME_RE.match(key)) and key not in WRITE_DENYLIST
+    return bool(ENV_NAME_RE.match(key)) and not _is_denied(key)
 
 
 def assert_writable(key: str) -> None:
     """Raise :class:`EnvPolicyError` unless *key* passes the name and deny gates."""
     assert_valid_name(key)
-    if key in WRITE_DENYLIST:
+    if _is_denied(key):
         raise EnvPolicyError(_DENY_MESSAGE.format(key=key))
 
 

@@ -10,6 +10,7 @@ import pytest
 from agentos.engine.runtime import _SelectorFallbackProvider
 from agentos.provider import DoneEvent as ProviderDone
 from agentos.provider import ErrorEvent as ProviderError
+from agentos.provider import QuotaStatus
 from agentos.provider import TextDeltaEvent as ProviderText
 from agentos.provider.circuit_breaker import (
     BreakerSettings,
@@ -241,3 +242,66 @@ async def test_repeated_error_events_in_one_stream_count_once() -> None:
     assert breaker.status("openrouter").consecutive_failures == 1
     assert breaker.status("ollama").consecutive_failures == 1
     assert breaker.state("ollama") is BreakerState.CLOSED
+
+
+def test_next_fallback_after_failure_exhausted_chain_raises_clear_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An already-exhausted chain raises the clear message, not a bare index error.
+
+    Regression for the clamp in ``next_fallback_after_failure``: once ``_index``
+    sits on the last link, ``start`` lands past the end of the rebuilt chain and
+    must raise the same ``IndexError`` ``next_fallback`` raises — not a bare
+    ``list index out of range`` from ``_first_admitted_index``.
+    """
+    from agentos.provider import selector as selector_module
+
+    def _fake_build(cfg: ProviderConfig) -> _StubProvider:
+        return _StubProvider(cfg.provider, [[ProviderDone(stop_reason="stop")]])
+
+    monkeypatch.setattr(selector_module, "_build_provider", _fake_build)
+
+    selector = ModelSelector(
+        SelectorConfig(
+            primary=ProviderConfig("openrouter", "openai/gpt-5.6-luna", api_key="k"),
+            fallbacks=[ProviderConfig("ollama", "llama3")],
+        ),
+    )
+
+    # First failover advances to the single fallback link.
+    selector.next_fallback_after_failure(RuntimeError("primary down"))
+    assert selector.active_provider_id == "ollama"
+
+    # The chain is now exhausted: the clear message, not a bare IndexError.
+    with pytest.raises(IndexError, match="No more provider fallbacks available"):
+        selector.next_fallback_after_failure(RuntimeError("fallback down"))
+
+
+def test_next_fallback_after_failure_empty_plugin_chain_raises_clear_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A plugin that returns an empty chain raises the same clear message."""
+    from agentos.provider import selector as selector_module
+
+    def _fake_build(cfg: ProviderConfig) -> _StubProvider:
+        return _StubProvider(cfg.provider, [[ProviderDone(stop_reason="stop")]])
+
+    monkeypatch.setattr(selector_module, "_build_provider", _fake_build)
+
+    class _EmptyFailoverPlugin:
+        def failover_hook(self, primary_failure: Exception) -> list[ProviderConfig]:
+            return []
+
+        def quota_hook(self, session_id: str) -> QuotaStatus:
+            return QuotaStatus()
+
+    selector = ModelSelector(
+        SelectorConfig(
+            primary=ProviderConfig("openrouter", "openai/gpt-5.6-luna", api_key="k"),
+            fallbacks=[ProviderConfig("ollama", "llama3")],
+        ),
+        plugin=_EmptyFailoverPlugin(),
+    )
+
+    with pytest.raises(IndexError, match="No more provider fallbacks available"):
+        selector.next_fallback_after_failure(RuntimeError("primary down"))

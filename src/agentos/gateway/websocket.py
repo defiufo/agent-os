@@ -570,6 +570,8 @@ class SubscriptionManager:
     def unsubscribe_messages(self, conn_id: str, session_key: str) -> None:
         if session_key in self._message_subs:
             self._message_subs[session_key].discard(conn_id)
+            if not self._message_subs[session_key]:
+                del self._message_subs[session_key]
 
     def get_message_subscribers(self, session_key: str) -> set[str]:
         return set(self._message_subs.get(session_key, set()))
@@ -591,8 +593,13 @@ class SubscriptionManager:
     def remove_connection(self, conn_id: str) -> None:
         """Clean up all subscriptions for a disconnected connection."""
         self._session_subs.discard(conn_id)
-        for subs in self._message_subs.values():
+        empty_keys: list[str] = []
+        for key, subs in self._message_subs.items():
             subs.discard(conn_id)
+            if not subs:
+                empty_keys.append(key)
+        for key in empty_keys:
+            del self._message_subs[key]
         empty_topics = []
         for topic, subs in self._topic_subs.items():
             subs.discard(conn_id)

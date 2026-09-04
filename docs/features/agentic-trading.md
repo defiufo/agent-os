@@ -96,6 +96,8 @@ before they execute anything.
 | `gmgn-portfolio` | Wallet analysis: holdings, realized and unrealized P&L, win rate, history, developer-wallet token history, and allocation drift versus a target mix. |
 | `gmgn-track` | Real-time buy and sell activity from Smart Money wallets, KOL wallets, and wallets you follow. |
 | `gmgn-holder-analysis` | Holder-structure analysis: chip distribution, entry cost, whale and dev behavior, and risk wallets. |
+| `gmgn-wallet-analysis` | Copy-trade dossier on one wallet: four pass/fail gates (authenticity, currency, reachability, survivability), what it holds and buys now, copy window, and a size cap. |
+| `gmgn-wallet-score` | Wallet scoring across three angles: track record, copy-tradeability (with a latency/slippage/gas backtest), and developer reputation for token-launcher wallets. |
 | `gmgn-cooking` | Token creation and launchpad launches, and launchpad creation statistics. |
 | `senior-unilp-manager` | Uniswap V4 liquidity on Base (`8453`) and Robinhood Chain (`4663`): inspect pools and positions, then mint, increase, decrease, collect fees, or burn. |
 

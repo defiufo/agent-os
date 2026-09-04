@@ -97,6 +97,75 @@ def test_parse_cron_rejects_reversed_range_with_step() -> None:
         parse_cron("0 0 * dec-feb/2 *")
 
 
+# --- POSIX day-of-month / day-of-week OR rule ----------------------------
+
+
+def test_dom_and_dow_both_restricted_fire_on_either() -> None:
+    # "0 0 1,15 * 5" means the 1st, the 15th, OR any Friday. ANDing the two
+    # fields restricted it to a 1st/15th that also happened to be a Friday,
+    # which silently killed the schedule for virtually the whole month.
+    expr = parse_cron("0 0 1,15 * 5")
+    assert expr.matches(datetime(2026, 8, 7, 0, 0))  # Friday, neither 1st nor 15th
+    assert expr.matches(datetime(2026, 8, 1, 0, 0))  # 1st, a Saturday
+    assert expr.matches(datetime(2026, 8, 15, 0, 0))  # 15th, a Saturday
+    assert expr.matches(datetime(2026, 8, 14, 0, 0))  # Friday
+    assert not expr.matches(datetime(2026, 8, 6, 0, 0))  # Thursday, neither day
+
+
+def test_dom_and_dow_or_rule_still_honours_minute_hour_month() -> None:
+    # OR applies to the two day fields only — the other three still AND.
+    expr = parse_cron("30 9 1,15 8 5")
+    assert expr.matches(datetime(2026, 8, 7, 9, 30))
+    assert not expr.matches(datetime(2026, 8, 7, 9, 31))  # wrong minute
+    assert not expr.matches(datetime(2026, 8, 7, 10, 30))  # wrong hour
+    assert not expr.matches(datetime(2026, 9, 4, 9, 30))  # Friday, wrong month
+
+
+def test_dow_wildcard_keeps_and_semantics() -> None:
+    # Only one field restricted: no OR, or "0 0 1 * *" would fire every day.
+    expr = parse_cron("0 0 1 * *")
+    assert expr.matches(datetime(2026, 8, 1, 0, 0))
+    assert not expr.matches(datetime(2026, 8, 7, 0, 0))
+
+
+def test_dom_wildcard_keeps_and_semantics() -> None:
+    expr = parse_cron("0 0 * * 5")
+    assert expr.matches(datetime(2026, 8, 7, 0, 0))  # Friday
+    assert not expr.matches(datetime(2026, 8, 6, 0, 0))  # Thursday
+
+
+def test_both_wildcards_match_every_day() -> None:
+    expr = parse_cron("0 0 * * *")
+    assert expr.matches(datetime(2026, 8, 6, 0, 0))
+    assert expr.matches(datetime(2026, 8, 7, 0, 0))
+
+
+def test_step_over_star_counts_as_restricted() -> None:
+    # Only a bare "*" is a wildcard: "*/2" names a specific set of days, so the
+    # OR rule applies — same call croniter makes.
+    expr = parse_cron("0 0 */2 * 5")  # day-of-month 1,3,5,...,31
+    assert expr.matches(datetime(2026, 8, 5, 0, 0))  # Wednesday the 5th, via day-of-month
+    assert expr.matches(datetime(2026, 8, 14, 0, 0))  # Friday the 14th, via day-of-week
+    assert not expr.matches(datetime(2026, 8, 6, 0, 0))  # Thursday the 6th, neither
+
+
+def test_wildcard_flag_is_recorded_per_field() -> None:
+    expr = parse_cron("0 0 1,15 * 5")
+    assert not expr.day_of_month.is_wildcard
+    assert expr.month.is_wildcard
+    assert not expr.day_of_week.is_wildcard
+    assert parse_cron("0 0 * * *").day_of_month.is_wildcard
+    assert not parse_cron("0 0 1-31 * *").day_of_month.is_wildcard
+
+
+def test_weekly_preset_is_unaffected_by_the_or_rule() -> None:
+    # "@weekly" expands to "0 0 * * 0" — day-of-month is a wildcard, so it
+    # stays a Sunday-only schedule rather than firing daily.
+    expr = parse_cron("@weekly")
+    assert expr.matches(datetime(2026, 8, 30, 0, 0))  # Sunday
+    assert not expr.matches(datetime(2026, 8, 31, 0, 0))  # Monday
+
+
 # --- parse_iso_at --------------------------------------------------------
 
 

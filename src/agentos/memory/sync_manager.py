@@ -43,6 +43,21 @@ class SessionDeltaTracker:
         self._pending_messages = 0
 
 
+@dataclass(frozen=True)
+class FileSyncFailures:
+    """Paths a single ``_do_file_sync()`` pass could not apply to the store.
+
+    Both sets are re-enqueued by the caller so a transient store error
+    (SQLite lock, provider timeout) does not drop the path forever.
+    """
+
+    failed_changes: frozenset[str] = frozenset()
+    failed_deletes: frozenset[str] = frozenset()
+
+    def __bool__(self) -> bool:
+        return bool(self.failed_changes or self.failed_deletes)
+
+
 class MemorySyncManager:
     """Manages all memory sync triggers through a unified sync() entry point.
 
@@ -116,8 +131,12 @@ class MemorySyncManager:
         #    embedding content we are about to throw away.
         if self._ttl_enabled():
             await self._do_ttl_sweep(initial=True)
-        # 2. THEN initial sync — surviving files get indexed.
-        await self._do_file_sync()
+        # 2. THEN initial sync — surviving files get indexed. _mtimes is
+        #    empty here, so a file whose index fails now would never be
+        #    rediscovered by the watcher diff; re-enqueue it explicitly.
+        initial_failures = await self._do_file_sync()
+        if initial_failures:
+            self._requeue(initial_failures, reason="initial")
         await self._do_session_sync(reason="initial")
         # 3. Now start background loops.
         self._poll_task = asyncio.create_task(self._poll_loop())
@@ -145,11 +164,12 @@ class MemorySyncManager:
     async def sync(self, reason: str, *, force: bool = False) -> None:
         """Unified sync entry point.
 
-        Re-enqueues ``store.remove_file`` failures into
-        ``_pending_deletes`` so a transient SQLite lock does not lose
-        the path forever. Without this the first watcher tick would clear
-        the queue regardless of outcome and orphan SQLite chunks for any
-        path whose retry also failed.
+        Re-enqueues ``store.index_file`` failures into ``_pending_changes``
+        and ``store.remove_file`` failures into ``_pending_deletes`` so a
+        transient store error does not lose the path forever. Without this
+        the first watcher tick would clear the queue regardless of outcome:
+        an unindexed file would keep its recorded mtime and never be
+        rediscovered, and a failed delete would orphan SQLite chunks.
         """
         is_search_reason = reason == "search" or reason.startswith("search:")
         session_delta_pending = self._delta.has_pending()
@@ -167,22 +187,14 @@ class MemorySyncManager:
             deletes = set(self._pending_deletes)
             self._pending_changes.clear()
             self._pending_deletes.clear()
-            failed_deletes = await self._do_file_sync(
-                changes=changes, deletes=deletes
-            )
+            failures = await self._do_file_sync(changes=changes, deletes=deletes)
         else:
-            failed_deletes = await self._do_file_sync(force=force)
+            failures = await self._do_file_sync(force=force)
 
         session_sync_failed = await self._do_session_sync(reason=reason, force=force)
 
-        if failed_deletes:
-            self._pending_deletes.update(failed_deletes)
-            self._dirty = True
-            logger.warning(
-                "sync_manager.deletes_requeued",
-                reason=reason,
-                paths=sorted(failed_deletes),
-            )
+        if failures:
+            self._requeue(failures, reason=reason)
         else:
             # Don't clobber _dirty=True set by a concurrent _do_ttl_sweep
             # (separate background task). If anything is still queued,
@@ -217,6 +229,28 @@ class MemorySyncManager:
 
     # --- Internal ---
 
+    def _requeue(self, failures: FileSyncFailures, *, reason: str) -> None:
+        """Put paths the store rejected back on the pending queues.
+
+        Keeps the manager dirty so the next watcher tick retries them even
+        though nothing on disk changed.
+        """
+        if failures.failed_changes:
+            self._pending_changes.update(failures.failed_changes)
+            logger.warning(
+                "sync_manager.changes_requeued",
+                reason=reason,
+                paths=sorted(failures.failed_changes),
+            )
+        if failures.failed_deletes:
+            self._pending_deletes.update(failures.failed_deletes)
+            logger.warning(
+                "sync_manager.deletes_requeued",
+                reason=reason,
+                paths=sorted(failures.failed_deletes),
+            )
+        self._dirty = True
+
     def _scan_files(self) -> dict[str, float]:
         """Scan watched paths and return {relative_path: mtime}."""
         result: dict[str, float] = {}
@@ -233,6 +267,26 @@ class MemorySyncManager:
                     if not is_memory_source_path(rel):
                         continue
                     result[rel] = path.stat().st_mtime
+        kb_dir = self._workspace_dir / "knowledge_base"
+        if kb_dir.is_dir():
+            from .ingest import MAX_DOCUMENT_SIZE_BYTES, SUPPORTED_EXTENSIONS
+
+            for path in kb_dir.rglob("*"):
+                if path.is_file():
+                    rel_to_kb = path.relative_to(kb_dir)
+                    if any(part.startswith(".") for part in rel_to_kb.parts):
+                        continue
+                    suffix = path.suffix.lower()
+                    if suffix not in SUPPORTED_EXTENSIONS and suffix != "":
+                        continue
+                    try:
+                        stat = path.stat()
+                        if stat.st_size > MAX_DOCUMENT_SIZE_BYTES:
+                            continue
+                        rel = path.relative_to(self._workspace_dir).as_posix()
+                        result[rel] = stat.st_mtime
+                    except OSError:
+                        continue
         return result
 
     async def _do_file_sync(
@@ -241,14 +295,18 @@ class MemorySyncManager:
         changes: set[str] | None = None,
         deletes: set[str] | None = None,
         force: bool = False,
-    ) -> set[str]:
+    ) -> FileSyncFailures:
         """Re-index changed and deleted files from disk.
 
-        Returns the set of delete paths whose ``store.remove_file`` raised
-        (anything other than success). Caller is expected to re-enqueue
-        them so a transient SQLite lock does not orphan chunks. Index
-        failures stay log-only because the file is still on disk and the
-        next watcher tick will rediscover it via mtime.
+        Returns the paths the store rejected: those whose
+        ``store.index_file`` raised and those whose ``store.remove_file``
+        raised. Caller is expected to re-enqueue both so a transient store
+        error does not orphan chunks or leave a file unindexed.
+
+        Index failures cannot be left to the watcher: ``self._mtimes`` is
+        replaced with the fresh scan *before* the index loop runs, so a
+        failing path already counts as seen and the next diff would find
+        it unchanged.
         """
         if changes is None or deletes is None:
             current = self._scan_files()
@@ -275,23 +333,45 @@ class MemorySyncManager:
                 failed_deletes.add(rel_path)
                 logger.warning("sync_manager.remove_failed", path=rel_path)
 
+        failed_changes: set[str] = set()
         for rel_path in changes:
             abs_path = self._workspace_dir / rel_path
             if not abs_path.is_file():
                 continue
             try:
-                content = abs_path.read_text(encoding="utf-8", errors="replace")
+                source_mtime = self._mtimes.get(rel_path)
+                is_kb = rel_path.startswith("knowledge_base/") or rel_path.startswith(
+                    "knowledge_base\\"
+                )
+                if is_kb:
+                    from .ingest import extract_document_text
+
+                    content = extract_document_text(abs_path)
+                    source = MemorySource.knowledge_base
+                else:
+                    content = abs_path.read_text(encoding="utf-8", errors="replace")
+                    source = MemorySource.memory
                 n = await self._store.index_file(
                     path=rel_path,
                     content=content,
-                    source=MemorySource.memory,
+                    source=source,
+                    mtime=source_mtime,
                 )
                 if n > 0:
-                    logger.info("sync_manager.indexed", path=rel_path, chunks=n)
+                    logger.info(
+                        "sync_manager.indexed",
+                        path=rel_path,
+                        chunks=n,
+                        source=source.value,
+                    )
             except Exception:
+                failed_changes.add(rel_path)
                 logger.warning("sync_manager.index_failed", path=rel_path)
 
-        return failed_deletes
+        return FileSyncFailures(
+            failed_changes=frozenset(failed_changes),
+            failed_deletes=frozenset(failed_deletes),
+        )
 
     async def _do_session_sync(self, *, reason: str, force: bool = False) -> bool:
         """Sync the derived sessions source when the current trigger can affect it.
@@ -301,12 +381,17 @@ class MemorySyncManager:
         """
         if self._session_indexer is None:
             return False
-        should_sync = force or reason in {
-            "initial",
-            "manual",
-            "session-start",
-            "session-delta",
-        } or reason.startswith("search:")
+        should_sync = (
+            force
+            or reason
+            in {
+                "initial",
+                "manual",
+                "session-start",
+                "session-delta",
+            }
+            or reason.startswith("search:")
+        )
         if not should_sync:
             return False
         try:
@@ -351,10 +436,10 @@ class MemorySyncManager:
                     now - self._last_change_time >= self._debounce_seconds
                 ):
                     # sync(reason="watch") atomically snapshots, clears,
-                    # and re-enqueues failed store removals. Do NOT clear
-                    # _pending_* here — that would wipe the re-enqueued
-                    # failures and orphan SQLite chunks on transient
-                    # errors.
+                    # and re-enqueues failed store indexes and removals.
+                    # Do NOT clear _pending_* here — that would wipe the
+                    # re-enqueued failures, orphaning SQLite chunks and
+                    # dropping retries on transient errors.
                     await self.sync(reason="watch")
 
             except asyncio.CancelledError:

@@ -8,11 +8,13 @@ from agentos.engine.pricing import (
     PriceEntry,
     PricingCache,
     _parse_opencap_prices,
+    _parse_surplus_prices,
     calculate_cost_usd,
     lookup_price,
     reset_live_price_cache_for_tests,
     seed_live_price_cache_for_tests,
     seed_opencap_price_cache,
+    seed_surplus_price_cache,
 )
 
 
@@ -537,3 +539,233 @@ def test_opencap_static_fallback_is_reported_once_per_model(
         kwargs["model"] for event, kwargs in warnings if event == "pricing.opencap_static_fallback"
     ]
     assert events == ["minimax-m3", "glm-5.2"]
+
+
+def _surplus_catalog_payload() -> dict[str, object]:
+    """Surplus publishes OpenRouter-shaped, USD-per-token rates as strings."""
+    return {
+        "data": [
+            {
+                "id": "claude-opus-5",
+                "pricing": {
+                    "prompt": "0.0000050000",
+                    "completion": "0.0000250000",
+                    "input_cache_read": "0.0000005000",
+                },
+            }
+        ]
+    }
+
+
+def test_surplus_pricing_scales_per_token_catalog_rates_to_per_million() -> None:
+    prices = _parse_surplus_prices(_surplus_catalog_payload())
+
+    assert list(prices) == ["claude-opus-5"]
+    entry = prices["claude-opus-5"]
+    assert entry.input_per_m == pytest.approx(5.0)
+    assert entry.output_per_m == pytest.approx(25.0)
+    assert entry.cached_input_per_m == pytest.approx(0.5)
+
+
+def test_surplus_pricing_rejects_non_finite_and_negative_catalog_rates() -> None:
+    prices = _parse_surplus_prices(
+        {
+            "data": [
+                {"id": "nan", "pricing": {"prompt": float("nan"), "completion": "0.000001"}},
+                {"id": "infinite", "pricing": {"prompt": "0.000001", "completion": float("inf")}},
+                {"id": "negative", "pricing": {"prompt": "-0.000001", "completion": "0.000001"}},
+                {"id": "unpriced", "pricing": {}},
+                {
+                    "id": "valid",
+                    "pricing": {
+                        "prompt": "0.0000002",
+                        "completion": "0.0000008",
+                        "input_cache_read": float("-inf"),
+                    },
+                },
+            ]
+        }
+    )
+
+    assert list(prices) == ["valid"]
+    assert prices["valid"].input_per_m == pytest.approx(0.2)
+    assert prices["valid"].output_per_m == pytest.approx(0.8)
+    assert prices["valid"].cached_input_per_m is None
+
+
+def test_surplus_live_price_is_scoped_away_from_the_other_gateways(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The three gateways resell the same bare id at their own rates, so each
+    cache has to answer only for its own provider."""
+    monkeypatch.setenv("AGENTOS_SURPLUS_LIVE_PRICING", "1")
+    monkeypatch.setattr(
+        pricing,
+        "_fetch_surplus_catalog_sync",
+        lambda: pytest.fail("a fresh boot seed must not trigger a refresh"),
+    )
+    seed_surplus_price_cache(_surplus_catalog_payload())
+    seed_opencap_price_cache(
+        {"data": [{"id": "claude-opus-5", "pricing": {"input": 4.305, "output": 21.525}}]}
+    )
+
+    surplus = lookup_price("claude-opus-5", provider_id="surplus")
+    opencap = lookup_price("claude-opus-5", provider_id="opencap")
+    static = lookup_price("claude-opus-5")
+
+    assert surplus.input_per_m == pytest.approx(5.0)
+    assert opencap.input_per_m == pytest.approx(4.305)
+    assert static.input_per_m == pytest.approx(1.375)
+
+
+def test_surplus_cold_cache_refreshes_instead_of_using_another_gateways_table(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("AGENTOS_SURPLUS_LIVE_PRICING", "1")
+    calls: list[int] = []
+
+    def fake_fetch() -> dict[str, object]:
+        calls.append(1)
+        return _surplus_catalog_payload()
+
+    monkeypatch.setattr(pricing, "_fetch_surplus_catalog_sync", fake_fetch)
+
+    price = lookup_price("claude-opus-5", provider_id="surplus")
+    lookup_price("claude-opus-5", provider_id="surplus")
+
+    assert len(calls) == 1, "the cache must not refetch while still within its TTL"
+    assert price.output_per_m == pytest.approx(25.0)
+
+
+def test_surplus_unreachable_catalog_is_negative_cached_and_falls_back(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("AGENTOS_SURPLUS_LIVE_PRICING", "1")
+    calls: list[int] = []
+
+    def failing_fetch() -> None:
+        calls.append(1)
+        return None
+
+    monkeypatch.setattr(pricing, "_fetch_surplus_catalog_sync", failing_fetch)
+
+    first = lookup_price("claude-opus-5", provider_id="surplus")
+    second = lookup_price("claude-opus-5", provider_id="surplus")
+
+    assert len(calls) == 1, "a failed fetch must be negative cached, not retried per lookup"
+    assert first == second == PriceEntry(1.375, 6.875)
+
+
+def test_surplus_live_pricing_can_be_disabled_by_env(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("AGENTOS_SURPLUS_LIVE_PRICING", "0")
+    monkeypatch.setattr(
+        pricing,
+        "_fetch_surplus_catalog_sync",
+        lambda: pytest.fail("live pricing is disabled; no fetch may be issued"),
+    )
+
+    assert lookup_price("claude-opus-5", provider_id="surplus") == PriceEntry(1.375, 6.875)
+
+
+def test_surplus_static_fallback_is_reported_once_per_model(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    warnings: list[tuple[str, dict[str, object]]] = []
+
+    class RecordingLog:
+        def warning(self, event: str, **kwargs: object) -> None:
+            warnings.append((event, kwargs))
+
+        def info(self, event: str, **kwargs: object) -> None: ...
+
+        def debug(self, event: str, **kwargs: object) -> None: ...
+
+    monkeypatch.setenv("AGENTOS_SURPLUS_LIVE_PRICING", "0")
+    monkeypatch.setattr(pricing, "log", RecordingLog())
+
+    lookup_price("minimax-m3", provider_id="surplus")
+    lookup_price("minimax-m3", provider_id="surplus")
+    lookup_price("glm-5.2", provider_id="surplus")
+
+    events = [
+        kwargs["model"] for event, kwargs in warnings if event == "pricing.surplus_static_fallback"
+    ]
+    assert events == ["minimax-m3", "glm-5.2"]
+
+
+@pytest.mark.parametrize(
+    ("model", "provider", "expected_input", "expected_output", "expected_cached"),
+    [
+        ("deepseek-chat", "deepseek", 0.14, 0.28, 0.014),
+        ("deepseek-reasoner", "deepseek", 0.70, 2.50, 0.14),
+        ("claude-3-7-sonnet", "anthropic", 3.0, 15.0, 0.30),
+        ("claude-3-7-sonnet-20250219", "anthropic", 3.0, 15.0, 0.30),
+        ("claude-3-5-sonnet-20241022", "anthropic", 3.0, 15.0, None),
+        ("claude-3-5-haiku-20241022", "anthropic", 0.80, 4.0, None),
+        ("claude-3-opus-20240229", "anthropic", 15.0, 75.0, None),
+        ("gemini-2.5-flash", "gemini", 0.15, 0.60, None),
+        ("gemini-2.5-pro", "gemini", 1.25, 10.0, None),
+        ("gemini-2.0-flash", "gemini", 0.10, 0.40, 0.025),
+        ("gemini-1.5-pro", "gemini", 1.25, 5.0, 0.3125),
+        ("gpt-4o", "openai", 2.50, 10.0, None),
+        ("gpt-4o-2024-08-06", "openai", 2.50, 10.0, None),
+        ("gpt-4o-mini-2024-07-18", "openai", 0.15, 0.60, None),
+        ("o3-mini", "openai", 1.10, 4.40, None),
+        # Vendor-prefix normalisation mapping onto bare entries
+        ("anthropic/claude-3-7-sonnet", "anthropic", 3.0, 15.0, 0.30),
+        ("google/gemini-2.0-flash", "google", 0.10, 0.40, None),
+        ("deepseek/deepseek-reasoner", "deepseek", 0.70, 2.50, 0.14),
+        ("openai/gpt-4o", "openai", 2.50, 10.0, None),
+    ],
+)
+def test_direct_provider_pricing_resolves_accurately(
+    monkeypatch: pytest.MonkeyPatch,
+    model: str,
+    provider: str,
+    expected_input: float,
+    expected_output: float,
+    expected_cached: float | None,
+) -> None:
+    monkeypatch.setenv("AGENTOS_OPENROUTER_LIVE_PRICING", "0")
+
+    price = lookup_price(model, provider_id=provider)
+
+    assert price.input_per_m == pytest.approx(expected_input)
+    assert price.output_per_m == pytest.approx(expected_output)
+    if expected_cached is not None:
+        assert price.cached_input_per_m is not None
+        assert price.cached_input_per_m == pytest.approx(expected_cached)
+    else:
+        assert price.cached_input_per_m is None
+
+
+def test_calculate_cost_usd_with_deepseek_prompt_cache_hit() -> None:
+    price = lookup_price("deepseek-chat", provider_id="deepseek")
+
+    # 100k input tokens (80k cache hit + 20k regular), 10k output tokens
+    cost = calculate_cost_usd(
+        price,
+        input_tokens=100_000,
+        output_tokens=10_000,
+        cached_input_tokens=80_000,
+    )
+
+    expected = (20_000 * 0.14 + 80_000 * 0.014 + 10_000 * 0.28) / 1_000_000
+    assert cost == pytest.approx(expected)
+
+
+def test_calculate_cost_usd_with_anthropic_prompt_cache_hit() -> None:
+    price = lookup_price("claude-3-7-sonnet-20250219", provider_id="anthropic")
+
+    # 50k input tokens (40k cache read + 10k regular), 5k output tokens
+    cost = calculate_cost_usd(
+        price,
+        input_tokens=50_000,
+        output_tokens=5_000,
+        cached_input_tokens=40_000,
+    )
+
+    expected = (10_000 * 3.0 + 40_000 * 0.30 + 5_000 * 15.0) / 1_000_000
+    assert cost == pytest.approx(expected)

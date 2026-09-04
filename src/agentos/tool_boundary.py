@@ -19,6 +19,7 @@ class ToolCall:
     # Populated by the agent when available; consulted by tools.dispatch to
     # refuse calls whose origin lies inside an <untrusted> envelope.
     origin_trace: str | None = None
+    thought_signature: str | None = None
 
 
 @dataclass

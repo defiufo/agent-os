@@ -25,6 +25,8 @@ EXPECTED_GMGN_SKILLS = {
     "gmgn-swap",
     "gmgn-token",
     "gmgn-track",
+    "gmgn-wallet-analysis",
+    "gmgn-wallet-score",
 }
 
 
@@ -43,7 +45,7 @@ def test_gmgn_skills_declare_the_crypto_category(tmp_path: Path) -> None:
 
 
 def test_each_gmgn_skill_has_its_own_emoji(tmp_path: Path) -> None:
-    """The mark is shared, so the emoji is what tells the seven cards apart."""
+    """The mark is shared, so the emoji is what tells the nine cards apart."""
     specs = _gmgn_specs(tmp_path)
     emojis = {}
     for spec in specs:

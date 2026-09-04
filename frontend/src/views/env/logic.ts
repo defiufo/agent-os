@@ -200,10 +200,16 @@ export function validateNewName(name: string, known: EnvVarRow[]): string | null
  * and the `direction: rtl` trick used to keep the tail visibly relocates the
  * leading slash. Trimming to the last two segments keeps the identifying part
  * intact and leaves the full path for the title attribute.
+ *
+ * The gateway sends whatever `pathlib.Path` stringifies to, so on Windows the
+ * value arrives backslash-separated (`C:\Users\<name>\.agentos\.env`).
+ * Backslashes are normalised to `/` before splitting; without that every
+ * Windows path counts as a single segment and is returned untrimmed, which is
+ * exactly the overflow this function exists to prevent.
  */
 export function shortPath(path: string | undefined): string {
   if (!path) return ''
-  const segments = path.split('/').filter(Boolean)
+  const segments = path.replace(/\\/g, '/').split('/').filter(Boolean)
   if (segments.length <= 2) return path
   return t('env.shortPath', { tail: segments.slice(-2).join('/') })
 }

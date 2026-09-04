@@ -32,6 +32,7 @@ _PLAIN_TEXT_MARKDOWN_HINT = (
     "the user explicitly asks for raw Markdown."
 )
 _MARKDOWN_RENDER_HINTS = {
+    "email": _PLAIN_TEXT_MARKDOWN_HINT,
     "whatsapp": _PLAIN_TEXT_MARKDOWN_HINT,
     "signal": _PLAIN_TEXT_MARKDOWN_HINT,
     "sms": _PLAIN_TEXT_MARKDOWN_HINT,

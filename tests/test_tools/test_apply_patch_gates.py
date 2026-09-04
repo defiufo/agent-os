@@ -495,3 +495,82 @@ async def test_apply_patch_add_file_refuses_existing_file(tmp_path: Path) -> Non
     finally:
         current_tool_context.reset(token)
     assert target.read_text(encoding="utf-8") == "old\n"
+
+
+@pytest.mark.asyncio
+async def test_apply_patch_records_workspace_file_writes_for_add_and_update(
+    tmp_path: Path,
+) -> None:
+    existing = tmp_path / "existing.csv"
+    existing.write_text("a,b\n1,2\n", encoding="utf-8")
+    ctx = ToolContext(workspace_dir=str(tmp_path))
+    token = current_tool_context.set(ctx)
+    apply_patch = _original_async(patch_tool.apply_patch)
+    try:
+        result = await apply_patch(
+            """*** Begin Patch
+*** Add File: created.json
++{"hello": "world"}
+*** Update File: existing.csv
+@@@ -1,2 +1,3 @@@
+ a,b
+ 1,2
++3,4
+*** End Patch"""
+        )
+    finally:
+        current_tool_context.reset(token)
+
+    assert "1 file(s) added, 1 file(s) modified" in result
+    written_relative_paths = [w["relative_path"] for w in ctx.workspace_file_writes]
+    assert "created.json" in written_relative_paths
+    assert "existing.csv" in written_relative_paths
+
+
+@pytest.mark.asyncio
+async def test_apply_patch_supports_hunk_header_without_explicit_counts(
+    tmp_path: Path,
+) -> None:
+    existing = tmp_path / "hello.txt"
+    existing.write_text("line1\n", encoding="utf-8")
+    token = current_tool_context.set(ToolContext(workspace_dir=str(tmp_path)))
+    apply_patch = _original_async(patch_tool.apply_patch)
+    try:
+        result = await apply_patch(
+            """*** Begin Patch
+*** Update File: hello.txt
+@@@ -1 +1,2 @@@
+ line1
++line2
+*** End Patch"""
+        )
+    finally:
+        current_tool_context.reset(token)
+
+    assert result == "Applied patch: 1 file(s) modified"
+    assert existing.read_text(encoding="utf-8") == "line1\nline2\n"
+
+
+@pytest.mark.parametrize(
+    "header",
+    [
+        "@@@",
+        "@@@ @@@",
+        "@@@ -abc +def @@@",
+        "@@@ - +1 @@@",
+        "@@@ -1 + @@@",
+        "@@@ -1,2 @@@",
+        "@@@ +1,2 @@@",
+        "@@@ -1 +1",
+        "-1 +1 @@@",
+        "@@@ -1, +1,2 @@@",
+        "@@@ -1,2 +1, @@@",
+        "",
+        "not a header at all",
+    ],
+)
+def test_parse_hunk_header_rejects_malformed_input(header: str) -> None:
+    from agentos.tools.builtin.patch import _parse_hunk_header
+
+    with pytest.raises(ValueError, match="Invalid hunk header"):
+        _parse_hunk_header(header)

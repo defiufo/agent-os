@@ -140,10 +140,26 @@ def can_deliver_channel_files(channel: Any) -> bool:
     return True
 
 
+def _safe_delivery_leaf(filename: str, source: Path) -> str:
+    """Return a safe single-path-component filename leaf for delivery.
+
+    Falls back to source.name when filename is empty or dots-only, and to
+    'artifact' if source.name is also dots-only or empty.
+    """
+    leaf = Path(filename).name.strip() if filename else ""
+    if leaf and leaf not in (".", "..") and leaf.strip("."):
+        return leaf
+    source_leaf = source.name.strip() if source.name else ""
+    if source_leaf and source_leaf not in (".", "..") and source_leaf.strip("."):
+        return source_leaf
+    return "artifact"
+
+
 @contextlib.contextmanager
 def _named_artifact_delivery_path(source: Path, filename: str) -> Iterator[Path]:
+    safe_name = _safe_delivery_leaf(filename, source)
     with tempfile.TemporaryDirectory(prefix="agentos-artifact-") as tmp_dir:
-        target = Path(tmp_dir) / Path(filename).name
+        target = Path(tmp_dir) / safe_name
         try:
             target.hardlink_to(source)
         except OSError:

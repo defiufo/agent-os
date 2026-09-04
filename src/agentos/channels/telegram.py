@@ -30,6 +30,7 @@ from agentos.channels._util import (
     EventDedupeCache,
     FloodStrikeBackoff,
     StreamThrottle,
+    check_channel_file_size,
 )
 from agentos.channels.contract import (
     ChannelCapabilities,
@@ -66,6 +67,10 @@ FATAL_ERROR_CLASSES: tuple[str, ...] = (
 _DEFAULT_TIMEOUT_S = 30.0
 _POLL_TIMEOUT_HEADROOM_S = 5.0
 _CONNECT_RETRY_DELAYS_S = (0.25, 0.5)
+#: Transport failures that happen before any request bytes are written, and so
+#: can be retried without risking a duplicate Bot API call.
+_PRE_SEND_CONNECT_ERRORS = (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout)
+
 #: ``TelegramApiError`` covers both "Telegram answered no" and "we never reached
 #: Telegram". These substrings mark the second kind, which is not a verdict on
 #: whatever was asked about — see :meth:`TelegramChannel.probe_target`.
@@ -157,6 +162,22 @@ def _coerce_telegram_int(value: Any) -> int | str:
     return str(value)
 
 
+def _slice_utf16(text: str, offset: int, length: int) -> str:
+    """Slice ``text`` by a Telegram message-entity offset/length.
+
+    Telegram entity ``offset``/``length`` are counted in UTF-16 code units
+    (per the Bot API), while Python string indexing is by Unicode code point.
+    Any non-BMP character (emoji, some CJK-ext, math letters) earlier in the
+    message is one Python index but two UTF-16 units, so slicing the ``str``
+    directly drifts and misaligns the extracted mention/command. Encode to
+    UTF-16 and slice on the code-unit grid so the entity lines up exactly.
+    """
+    if offset < 0 or length < 0:
+        return ""
+    u16 = text.encode("utf-16-le")
+    return u16[offset * 2 : (offset + length) * 2].decode("utf-16-le", errors="replace")
+
+
 @dataclass
 class TelegramChannel:
     """Managed adapter for Telegram Bot API polling or webhooks."""
@@ -166,6 +187,7 @@ class TelegramChannel:
 
     supports_slash_commands: bool = True
     typing_keepalive_interval_s: ClassVar[float] = 4.0
+    MAX_FILE_BYTES: ClassVar[int] = 50 * 1024 * 1024
     policy: ChannelAccessPolicy = field(
         default_factory=lambda: ChannelAccessPolicy(
             dm_allowed=True,
@@ -497,7 +519,15 @@ class TelegramChannel:
                     request_kwargs["timeout"] = request_timeout
                 response = await client.post(f"/bot{self.config.token}/{method}", **request_kwargs)
                 break
-            except httpx.ConnectError:
+            except _PRE_SEND_CONNECT_ERRORS:
+                # Nothing reached Telegram yet — DNS/TLS never completed, or we
+                # never got a pooled connection to write to — so resending is
+                # safe. ConnectTimeout and PoolTimeout are TimeoutException
+                # siblings of ConnectError, not subclasses, so they have to be
+                # named here or they fall through to the generic branch below
+                # and fail on the first attempt. ReadTimeout deliberately stays
+                # out: by then the request is in flight, and re-sending a
+                # getUpdates long poll would double-poll it.
                 if retry_delay is None:
                     raise TelegramApiError(f"Telegram {method} connection failed") from None
                 log.warning(
@@ -1084,7 +1114,7 @@ class TelegramChannel:
                 if entity_type == "mention":
                     offset = int(entity.get("offset", 0))
                     length = int(entity.get("length", 0))
-                    if text[offset : offset + length].lower() == mention:
+                    if _slice_utf16(text, offset, length).lower() == mention:
                         return True
                 if entity_type == "text_mention":
                     user = entity.get("user") or {}
@@ -1093,7 +1123,7 @@ class TelegramChannel:
                 if entity_type == "bot_command":
                     offset = int(entity.get("offset", 0))
                     length = int(entity.get("length", 0))
-                    command = text[offset : offset + length]
+                    command = _slice_utf16(text, offset, length)
                     _, separator, target = command.partition("@")
                     if not separator:
                         return True
@@ -1395,6 +1425,7 @@ class TelegramChannel:
         if not self.config.token:
             raise ValueError("telegram.send_file requires token")
         path = Path(file_path)
+        check_channel_file_size(path, self.MAX_FILE_BYTES, "Telegram")
         payload = {"chat_id": str(chat_id)}
         if content:
             payload["caption"] = render_telegram_html(content)

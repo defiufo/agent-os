@@ -365,18 +365,21 @@ class _ToolResultHandler:
         failure_summary = _artifact_delivery_failure_summary(event)
         if failure_summary is not None:
             state.artifact_delivery_failures.append(failure_summary)
-        if event.arguments is not None:
+        if event.arguments is not None or getattr(event, "thought_signature", None) is not None:
             for segment in reversed(state.turn_segments):
                 if (
                     segment.get("type") == "tool_use"
                     and segment.get("tool_use_id") == event.tool_use_id
                 ):
-                    segment["name"] = event.tool_name
-                    segment["input"] = _persisted_tool_use_input(
-                        event.tool_name,
-                        event.tool_use_id,
-                        event.arguments,
-                    )
+                    if event.arguments is not None:
+                        segment["name"] = event.tool_name
+                        segment["input"] = _persisted_tool_use_input(
+                            event.tool_name,
+                            event.tool_use_id,
+                            event.arguments,
+                        )
+                    if getattr(event, "thought_signature", None):
+                        segment["thought_signature"] = event.thought_signature
                     break
         state.turn_segments.append(_persisted_tool_result_segment(event))
         return event
@@ -509,12 +512,18 @@ class _DoneHandler:
             "estimated_output_savings_pct",
             0.03,
         )
+        # Price the turn from the model that actually ran. When routing was
+        # not applied — observe rollout, or an explicit model that beat the
+        # route in PromptAssemblerStage — ``routed_model`` is the router's
+        # advice, not what the provider billed, and pricing against it invents
+        # a cost (and a saving) for a model nobody called.
+        priced_model = routed_model if routing_applied else (event.model or routed_model)
         comprehensive = _compute_comprehensive_turn_savings(
             event,
             metadata,
             agentos_router_tiers,
-            routed_model,
-            routed_tier=str(routed_tier or ""),
+            priced_model,
+            routed_tier=str(routed_tier or "") if routing_applied else "",
             estimated_output_savings_pct=estimated_output_savings_pct,
         )
         provider_cache_hit = (event.cached_tokens or 0) > 0

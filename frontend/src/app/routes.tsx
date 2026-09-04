@@ -53,6 +53,9 @@ const loadSkills: LazyRoute = async () => ({
 const loadLogs: LazyRoute = async () => ({
   Component: (await import('@/views/logs/LogsPage')).LogsPage,
 })
+const loadMemory: LazyRoute = async () => ({
+  Component: (await import('@/views/memory/MemoryPage')).MemoryPage,
+})
 const loadEnv: LazyRoute = async () => ({
   Component: (await import('@/views/env/EnvPage')).EnvPage,
 })
@@ -69,6 +72,7 @@ const VIEW_ROUTES: ReadonlyArray<ViewRoute> = [
   { path: 'agents', titleKey: 'shell.viewAgents', lazy: loadAgents },
   { path: 'cron', titleKey: 'shell.viewCron', lazy: loadCron },
   { path: 'usage', titleKey: 'shell.viewUsage', lazy: loadUsage },
+  { path: 'memory', titleKey: 'shell.viewMemory', lazy: loadMemory },
   { path: 'settings', titleKey: 'shell.viewSettings', lazy: loadSettings },
   { path: 'config', titleKey: 'shell.viewConfig', lazy: loadSettings },
   { path: 'setup', titleKey: 'shell.viewSetup', lazy: loadSettings },

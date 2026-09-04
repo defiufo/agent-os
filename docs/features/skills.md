@@ -158,11 +158,12 @@ is gated on acquisition exactly the way publishers are, so a directory dropped
 into a writable skills path cannot claim a heading carrying the AgentOS name just
 by writing a category into its own frontmatter.
 
-Cards in that group carry a mark instead of the generic glyph. The seven bundled
+Cards in that group carry a mark instead of the generic glyph. The nine bundled
 GMGN skills (`gmgn-token`, `gmgn-market`, `gmgn-portfolio`, `gmgn-track`,
-`gmgn-holder-analysis`, `gmgn-swap`, `gmgn-cooking`) wear the GMGN mark — chosen
-on `provenance.origin: gmgn-mit`, badged with each skill's own
-`metadata.agentos.emoji` so seven siblings stay tellable apart — and the rest of
+`gmgn-holder-analysis`, `gmgn-wallet-analysis`, `gmgn-wallet-score`,
+`gmgn-swap`, `gmgn-cooking`) wear the GMGN mark — chosen on
+`provenance.origin: gmgn-mit`, badged with each skill's own
+`metadata.agentos.emoji` so nine siblings stay tellable apart — and the rest of
 the group wears the AgentOS mark. Every mark ships with the client; no manifest
 field points the UI at an image, remote or local.
 

@@ -20,10 +20,12 @@ import re
 import shlex
 import threading
 import time
+from collections import OrderedDict
 from pathlib import Path
 
 _DEFAULT_TTL_SECONDS = 30 * 60
 _ALWAYS_TTL_SECONDS = 365 * 24 * 3600  # effectively never expires within a session
+_DEFAULT_MAX_ENTRIES = 10_000
 
 
 def _norm_path(raw: str, *, base_dir: str | Path | None = None) -> str:
@@ -59,46 +61,44 @@ _SHELL_SEPARATORS = (";", "&&", "||", "|", "&")
 
 
 def _extract_rm_targets(command: str) -> list[str]:
-    """Pull every non-flag argument out of an ``rm`` invocation.
+    """Pull every non-flag argument out of every ``rm`` invocation.
 
     Handles ``rm a b c``, ``rm -rf /a /b``, quoted paths, and stops at shell
-    separators. Does not try to be a full shell parser — falls back to
-    whitespace split on shlex errors (unbalanced quotes).
+    separators. Uses ``finditer`` so ``rm foo; rm -rf /bar`` yields targets
+    from both invocations independently. Does not try to be a full shell
+    parser — falls back to whitespace split on shlex errors (unbalanced quotes).
     """
-    match = re.search(r"\brm\b([^\n]*)", command)
-    if not match:
+    pattern = re.compile(r"\brm\b([^;\n&|]*)")
+    matches = list(pattern.finditer(command))
+    if not matches:
         return []
-    tail = match.group(1)
-
-    # Cut at the first shell separator so ``rm foo; ls bar`` doesn't pick ``ls``/``bar``.
-    cut = len(tail)
-    for sep in _SHELL_SEPARATORS:
-        idx = tail.find(sep)
-        if idx != -1 and idx < cut:
-            cut = idx
-    tail = tail[:cut].strip()
-    if not tail:
-        return []
-
-    token_sets: list[list[str]] = []
-    try:
-        token_sets.append(shlex.split(tail))
-    except ValueError:
-        token_sets.append(tail.split())
-    if "\\" in tail and (os.name == "nt" or re.search(r"(?:^|\s)\\[^\s]", tail)):
-        try:
-            token_sets.append(shlex.split(tail, posix=False))
-        except ValueError:
-            token_sets.append(tail.split())
 
     targets: list[str] = []
     seen: set[str] = set()
-    for tokens in token_sets:
-        for token in tokens:
-            if not token or token.startswith("-") or token in seen:
-                continue
-            seen.add(token)
-            targets.append(token)
+
+    for match in matches:
+        tail = match.group(1).strip()
+        if not tail:
+            continue
+
+        token_sets: list[list[str]] = []
+        try:
+            token_sets.append(shlex.split(tail))
+        except ValueError:
+            token_sets.append(tail.split())
+        if "\\" in tail and (os.name == "nt" or re.search(r"(?:^|\s)\\[^\s]", tail)):
+            try:
+                token_sets.append(shlex.split(tail, posix=False))
+            except ValueError:
+                token_sets.append(tail.split())
+
+        for tokens in token_sets:
+            for token in tokens:
+                if not token or token.startswith("-") or token in seen:
+                    continue
+                seen.add(token)
+                targets.append(token)
+
     return targets
 
 
@@ -149,10 +149,17 @@ class IntentApprovalCache:
                   for the same intent until the process restarts.
     """
 
-    def __init__(self, default_ttl: float = _DEFAULT_TTL_SECONDS) -> None:
+    def __init__(
+        self,
+        default_ttl: float = _DEFAULT_TTL_SECONDS,
+        max_entries: int = _DEFAULT_MAX_ENTRIES,
+    ) -> None:
+        if max_entries <= 0:
+            raise ValueError("max_entries must be positive")
         self._default_ttl = default_ttl
-        # intent -> (expires_monotonic, scope)
-        self._entries: dict[tuple[str, str], tuple[float, str]] = {}
+        self._max_entries = max_entries
+        # intent -> (expires_monotonic, scope), ordered oldest to newest.
+        self._entries: OrderedDict[tuple[str, str], tuple[float, str]] = OrderedDict()
         self._lock = threading.Lock()
 
     def record(
@@ -169,7 +176,20 @@ class IntentApprovalCache:
             return []
         expires = time.monotonic() + (ttl if ttl is not None else self._default_ttl)
         with self._lock:
+            now = time.monotonic()
+            if len(self._entries) >= self._max_entries:
+                expired = [
+                    intent
+                    for intent, (deadline, _scope) in self._entries.items()
+                    if deadline < now
+                ]
+                for intent in expired:
+                    self._entries.pop(intent, None)
             for intent in intents:
+                # Refreshing an existing approval makes it the newest entry.
+                self._entries.pop(intent, None)
+                if len(self._entries) >= self._max_entries:
+                    self._entries.popitem(last=False)
                 self._entries[intent] = (expires, scope)
         return intents
 
@@ -213,11 +233,11 @@ class IntentApprovalCache:
     def clear_scope(self, scope: str) -> None:
         """Drop every entry whose scope matches, leaving other scopes intact."""
         with self._lock:
-            self._entries = {
-                intent: data
+            self._entries = OrderedDict(
+                (intent, data)
                 for intent, data in self._entries.items()
                 if data[1] != scope
-            }
+            )
 
 
 _cache: IntentApprovalCache | None = None

@@ -2,11 +2,53 @@
 
 from __future__ import annotations
 
+from collections.abc import MutableMapping
 from typing import Any, cast
 
 from agentos.engine.pipeline import TurnContext
 from agentos.engine.types import RouterDecisionEvent
 from agentos.router_tiers import normalize_text_tier, tier_index
+
+ROUTING_OVERRIDE_EXPLICIT_MODEL = "explicit_model"
+
+
+def reconcile_routing_metadata(
+    metadata: MutableMapping[str, Any],
+    resolved_model: str,
+) -> bool:
+    """Demote a routing decision the turn did not actually honor.
+
+    The Pilot Router writes its pick into ``turn.model``, but the model sent to
+    the provider is resolved as ``explicit > pipeline-routed > selector`` (see
+    :class:`~agentos.engine.turn_runner.prompt_assembler_stage.PromptAssemblerStage`).
+    An explicit per-call model — a durable ``config.agents[].model``, a session
+    pin, or an API override — therefore beats the route, while the router
+    metadata still advertised the route as applied. Everything reading that
+    metadata (``RouterDecisionEvent``, the ``DoneEvent``, per-turn usage and the
+    savings figures) then reported a model that never ran, and credited savings
+    against a price nobody was billed.
+
+    This reuses the ``routing_applied=False`` contract the ``observe`` rollout
+    phase already established: the tier and model stay on the record as the
+    router's advice, ``applied_model``/``baseline_model`` name the model that
+    really ran, and the unrealized savings are zeroed.
+
+    Returns ``True`` when the metadata was demoted.
+    """
+    if not metadata.get("routed_tier") or not resolved_model:
+        return False
+    applied_model = str(metadata.get("applied_model") or "")
+    if not applied_model or applied_model == resolved_model:
+        return False
+
+    metadata["routing_applied"] = False
+    metadata["routing_override_source"] = ROUTING_OVERRIDE_EXPLICIT_MODEL
+    metadata["applied_model"] = resolved_model
+    metadata["baseline_model"] = resolved_model
+    metadata["savings_pct"] = 0.0
+    metadata["savings_max_price_per_m"] = 0.0
+    metadata["savings_routed_price_per_m"] = 0.0
+    return True
 
 
 def _coerce_probs(value: object) -> list[float]:

@@ -57,7 +57,7 @@ async def test_onboarding_catalog_returns_providers_and_channels(tmp_path, monke
     assert "audioProviders" in payload
     assert "memoryEmbeddingProviders" in payload
     types = {c["type"] for c in payload["channels"]}
-    assert types == {"slack", "telegram", "discord"}
+    assert types == {"slack", "telegram", "discord", "email"}
     search_provider_ids = {p["providerId"] for p in payload["searchProviders"]}
     assert {"brave", "duckduckgo"} <= search_provider_ids
     image_provider_ids = {p["providerId"] for p in payload["imageGenerationProviders"]}

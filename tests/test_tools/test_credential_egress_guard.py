@@ -54,6 +54,22 @@ def ok_response(monkeypatch: pytest.MonkeyPatch) -> None:
         async def request(self, **kwargs: object) -> httpx.Response:
             return response
 
+        def build_request(self, **kwargs: object) -> httpx.Request:
+            return httpx.Request(
+                kwargs.get("method", "GET"),
+                kwargs.get("url", "https://example.test/"),
+                headers=kwargs.get("headers"),
+                content=kwargs.get("content"),
+            )
+
+        async def send(
+            self, _request: object, **kwargs: object
+        ) -> httpx.Response:
+            # The http_request tool now opens the stream via client.send(
+            # build_request(...), stream=True). Keep this mock compatible with
+            # both call shapes so the egress-guard request path stays tested.
+            return response
+
     monkeypatch.setattr(web.httpx, "AsyncClient", FakeAsyncClient)
 
 
@@ -193,3 +209,68 @@ class TestShellCommands:
         blocked = shell._sensitive_shell_block("exec_command", command)
         assert blocked is not None
         assert json.loads(blocked)["sensitive_payload"] == "credential_literal"
+
+
+# Assembled at run time like the PEM above, so the tracked file carries no
+# literal that matches a shipped vendor key shape.
+_VENDOR_KEY = "sk-ant-api03-" + "A" * 20
+
+
+class TestUrlUserinfo:
+    """A credential in URL userinfo egresses as an Authorization header.
+
+    The HTTP client converts ``https://user:***@host/`` into
+    ``Authorization: Basic base64(user:key)`` on the wire, so userinfo is an
+    exfiltration channel the path/query checks never saw.
+    """
+
+    @pytest.mark.asyncio
+    async def test_a_vendor_key_in_userinfo_is_blocked(self, ok_response: None) -> None:
+        url = f"https://user:{_VENDOR_KEY}@api.example.test/v1/quote"
+        payload = json.loads(await _http_request()(url=url))
+        assert payload["status"] == "blocked"
+        assert payload["sensitive_payload"] == "sensitive_url_userinfo"
+
+    @pytest.mark.asyncio
+    async def test_a_vendor_key_as_username_is_blocked(self, ok_response: None) -> None:
+        url = f"https://{_VENDOR_KEY}@api.example.test/v1/quote"
+        payload = json.loads(await _http_request()(url=url))
+        assert payload["status"] == "blocked"
+        assert payload["sensitive_payload"] == "sensitive_url_userinfo"
+
+    @pytest.mark.asyncio
+    async def test_a_percent_encoded_key_in_userinfo_is_blocked(
+        self, ok_response: None
+    ) -> None:
+        """The client percent-decodes userinfo before sending, so the guard must too."""
+        from urllib.parse import quote
+
+        url = f"https://user:{quote(_VENDOR_KEY, safe='')}@api.example.test/v1"
+        payload = json.loads(await _http_request()(url=url))
+        assert payload["status"] == "blocked"
+        assert payload["sensitive_payload"] == "sensitive_url_userinfo"
+
+    @pytest.mark.asyncio
+    async def test_a_plain_userinfo_password_is_sent(self, ok_response: None) -> None:
+        """Opaque userinfo credentials are normal HTTP Basic auth, not exfiltration."""
+        payload = json.loads(
+            await _http_request()(url="https://user:***@api.example.test/v1")
+        )
+        assert payload.get("status") != "blocked"
+
+    def test_the_marker_covers_userinfo_username_password_and_encoding(self) -> None:
+        from urllib.parse import quote
+
+        assert web._sensitive_url_marker(f"https://u:{_VENDOR_KEY}@h.example/x") == (
+            "sensitive_url_userinfo"
+        )
+        assert web._sensitive_url_marker(f"https://{_VENDOR_KEY}@h.example/x") == (
+            "sensitive_url_userinfo"
+        )
+        encoded = quote(_VENDOR_KEY, safe="")
+        assert web._sensitive_url_marker(f"https://u:{encoded}@h.example/x") == (
+            "sensitive_url_userinfo"
+        )
+        # Benign userinfo and plain URLs stay unmarked.
+        assert web._sensitive_url_marker("https://user:***@h.example/x") is None
+        assert web._sensitive_url_marker("https://h.example/x?k=***") is None

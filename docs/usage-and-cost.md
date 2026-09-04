@@ -46,6 +46,26 @@ agentos cost --by-model --json
 JSON output is useful for local dashboards, regression checks, and automated
 reports.
 
+## Report What Routing Saved
+
+```sh
+agentos cost savings
+agentos cost savings --start-date 2026-08-01 --end-date 2026-08-31
+agentos cost savings --pdf ~/pilot-router-savings.pdf
+```
+
+`agentos cost` shows what you spent; `agentos cost savings` shows what the
+[Pilot Router](features/agentos-router.md) avoided spending. It reads the local
+decision log instead of the gateway, so it works with the gateway stopped, and
+`--pdf` writes a branded one-page report you can send on.
+
+The baseline is the most expensive model configured in `[router.tiers]` — what
+every routed turn would have cost on your top tier — priced on input tokens
+only at list rates. That makes the figure a floor, not a full-turn saving, and
+it covers routing alone: tool-result projection, short-reply enforcement,
+prompt-cache hits and thinking mode are excluded. See
+[`cli.md`](cli.md#agentos-cost-savings) for the full option list.
+
 ## What to Check First
 
 | Signal | What it can mean |

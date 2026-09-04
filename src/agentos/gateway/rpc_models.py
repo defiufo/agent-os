@@ -53,9 +53,10 @@ async def collect_models(
     it before pinning: a typo'd id would otherwise install a hold that fails
     every subsequent turn at the provider.
 
-    Note on OpenCAP: its inference endpoint also serves namespaced ``<upstream>/
-    <model>`` aliases, but the PUBLIC catalog this reads publishes only the bare
-    canonical ids, so those aliases never appear here and are not pinnable.
+    Note on OpenCAP and Surplus: their inference endpoints also serve namespaced
+    ``<upstream>/<model>`` aliases, but the PUBLIC catalogs this reads publish
+    only the bare canonical ids, so those aliases never appear here and are not
+    pinnable.
     """
 
     models: list[dict[str, Any]] = []
@@ -66,7 +67,10 @@ async def collect_models(
         except Exception:
             pass
 
-    catalog_is_canonical = bool(models) and active_provider_id(ctx).lower() == "opencap"
+    catalog_is_canonical = bool(models) and active_provider_id(ctx).lower() in {
+        "opencap",
+        "surplus",
+    }
     if ctx.provider_selector is not None and not catalog_is_canonical:
         try:
             raw = await ctx.provider_selector.list_models()

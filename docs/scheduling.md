@@ -61,6 +61,12 @@ agentos cron add \
 
 Use `--exact` when you do not want the default stagger.
 
+Day-of-month and day-of-week follow the POSIX rule: when **both** fields are
+restricted (neither is a bare `*`), the job fires when *either* matches. So
+`0 0 1,15 * 5` runs on the 1st, the 15th, **or** any Friday. When one of the two
+is `*`, the fields are ANDed as usual — `0 0 1 * *` is the 1st only, and
+`0 0 * * 5` is Fridays only.
+
 ## Add a One-Time Job
 
 ```sh

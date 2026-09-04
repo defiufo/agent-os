@@ -82,7 +82,21 @@ Index and list memory sources:
 
 ```sh
 agentos memory index
-agentos memory list
+agentos memory list --source all
+```
+
+Ingest documents or folders into knowledge base:
+
+```sh
+agentos memory ingest /path/to/notes
+agentos memory ingest /path/to/architecture.pdf
+```
+
+Curate agent notes and user preferences:
+
+```sh
+agentos memory curated get --target memory
+agentos memory curated add "Always run unit tests before submitting PRs"
 ```
 
 Search and inspect memory:
@@ -92,9 +106,10 @@ agentos memory search "release note format"
 agentos memory show <path>
 ```
 
-Search previous sessions as well as memory:
+Search knowledge base, sessions, or all sources:
 
 ```sh
+agentos memory search "deployment decision" --source knowledge_base
 agentos memory search "deployment decision" --source all
 ```
 

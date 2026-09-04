@@ -151,7 +151,11 @@ with, not a membership boundary.
   history, and simply stop receiving the shared knowledge.
 - The agent can manage projects from prompting via the `projects_create`,
   `projects_list`, `projects_update`, and `projects_move_session` tools, and
-  can search sibling transcripts with `session_search scope=project`.
+  can search sibling transcripts with `session_search scope=project`. These
+  tools are scoped to the calling session — knowledge is readable/writable
+  only for the session's own project, and only the calling session itself can
+  be moved — because knowledge a tool writes lands in every member session's
+  system prompt. Cross-project management stays on the Web UI / CLI surface.
 - Existing databases migrate automatically on gateway start: old sessions
   come up project-less (`project_id` empty) and behave exactly as before.
 

@@ -156,6 +156,112 @@ def test_unverified_base_url_provider_rejected_before_configuration():
         upsert_llm_provider(cfg, provider_id="azure", model="x", api_key="k")
 
 
+@pytest.mark.parametrize(
+    "base_url",
+    [
+        "file:///etc/passwd",
+        "ftp://example.com/v1",
+        "openrouter.ai/api/v1",  # no scheme
+        "https://",  # no host
+        "http://[::1",  # unterminated IPv6 literal
+    ],
+)
+def test_upsert_provider_rejects_non_http_base_url(base_url):
+    cfg = GatewayConfig()
+    with pytest.raises(ValueError, match="base_url must"):
+        upsert_llm_provider(
+            cfg,
+            provider_id="openrouter",
+            model="x",
+            api_key="sk-test",
+            base_url=base_url,
+        )
+
+
+@pytest.mark.parametrize(
+    "base_url",
+    [
+        "http://169.254.169.254/latest/meta-data/iam/security-credentials/",
+        "http://[::ffff:169.254.169.254]/latest/meta-data/",
+        "http://metadata.google.internal/computeMetadata/v1/",
+        "http://10.0.0.1:8080/internal",
+        "http://192.168.1.10:11434/v1",
+        "http://172.16.4.2/v1",
+        # inet_aton forms of 169.254.169.254 / 10.0.0.1 — ``ipaddress`` rejects
+        # them, the resolver httpx uses does not.
+        "http://2852039166/latest/meta-data/",
+        "http://0251.0376.0251.0376/",
+        "http://167772161:8080/internal",
+        # Alibaba Cloud's metadata endpoint sits in a public range.
+        "http://100.100.100.200/latest/meta-data/",
+        "http://[fd00:ec2::254]/latest/meta-data/",
+    ],
+)
+def test_upsert_provider_rejects_internal_base_url(base_url):
+    # An RPC/CLI caller must not be able to point provider traffic — which
+    # carries the Authorization header — at cloud metadata or the LAN.
+    cfg = GatewayConfig()
+    with pytest.raises(ValueError, match="never a valid LLM provider|private/reserved"):
+        upsert_llm_provider(
+            cfg,
+            provider_id="openrouter",
+            model="x",
+            api_key="sk-test",
+            base_url=base_url,
+        )
+    assert cfg.llm.base_url != base_url
+
+
+@pytest.mark.parametrize(
+    "base_url",
+    [
+        "http://localhost:11434/v1",
+        "http://127.0.0.1:11434/v1",
+        "http://[::1]:11434/v1",
+    ],
+)
+def test_upsert_provider_allows_loopback_base_url(base_url):
+    cfg = GatewayConfig()
+    res = upsert_llm_provider(cfg, provider_id="ollama", model="llama3.1", base_url=base_url)
+    assert res.config.llm.base_url == base_url
+
+
+def test_upsert_provider_accepts_replayed_stored_base_url():
+    # The onboarding import path (flow.py) re-supplies the persisted base_url as
+    # an explicit argument. That is the same destination, not a new one, so a
+    # config that predates this check must not dead-end the wizard.
+    cfg = GatewayConfig()
+    cfg.llm.provider = "ollama"
+    cfg.llm.model = "llama3.1"
+    cfg.llm.base_url = "http://192.168.1.10:11434/v1"
+    res = upsert_llm_provider(
+        cfg,
+        provider_id="ollama",
+        model="llama3.2",
+        base_url="http://192.168.1.10:11434/v1",
+    )
+    assert res.config.llm.base_url == "http://192.168.1.10:11434/v1"
+
+
+def test_upsert_provider_treats_none_base_url_as_omitted():
+    # An RPC caller can send an explicit JSON null; params.get returns it as-is.
+    cfg = GatewayConfig()
+    res = upsert_llm_provider(cfg, provider_id="ollama", model="llama3.1", base_url=None)
+    assert res.config.llm.provider == "ollama"
+
+
+def test_upsert_provider_does_not_revalidate_saved_base_url():
+    # Only the caller-supplied argument is validated: an operator editing an
+    # unrelated field on a provider whose stored base_url predates this check
+    # (or is intentionally on-host) must not be locked out.
+    cfg = GatewayConfig()
+    cfg.llm.provider = "ollama"
+    cfg.llm.model = "llama3.1"
+    cfg.llm.base_url = "http://192.168.1.10:11434/v1"
+    res = upsert_llm_provider(cfg, provider_id="ollama", model="llama3.2")
+    assert res.config.llm.base_url == "http://192.168.1.10:11434/v1"
+
+
 def test_ollama_does_not_require_api_key():
     cfg = GatewayConfig()
     res = upsert_llm_provider(cfg, provider_id="ollama", model="llama3.1")

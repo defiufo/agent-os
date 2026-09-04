@@ -30,6 +30,7 @@ import '@/i18n/en/chat'
 
 export { publishArtifactTargetName } from './tools'
 
+import { isCardsArtifact } from './cards'
 import { isChartArtifact } from './chart'
 
 /* ── Artifact shape ─────────────────────────────────────────────────────── */
@@ -103,11 +104,13 @@ export function artifactExtension(name: string): string {
 }
 
 // chat.js:7538-7549 — category: visual | audio | data | document | code | file,
-// plus the AgentOS-native 'chart' category (chart.ts) which has no legacy
-// counterpart: it renders an inline chart rather than a download chip.
+// plus the AgentOS-native 'chart' (chart.ts) and 'cards' (cards.ts) categories,
+// which have no legacy counterpart: they render inline rather than as a
+// download chip.
 // NOTE: image/* maps to 'visual' (NOT 'image' — the brief example was wrong).
 export function artifactCategory(artifact: Artifact | null | undefined): string {
   if (isChartArtifact(artifact)) return 'chart'
+  if (isCardsArtifact(artifact)) return 'cards'
   const mime = artifactMime(artifact)
   if (mime.startsWith('image/')) return 'visual'
   if (mime.startsWith('audio/')) return 'audio'
@@ -125,6 +128,8 @@ export function artifactCategoryLabel(category: string): string {
   switch (category) {
     case 'chart':
       return 'chart'
+    case 'cards':
+      return 'cards'
     case 'data':
       return 'data'
     case 'document':
@@ -282,7 +287,14 @@ export function createArtifactRenderer(deps: ArtifactRendererDeps) {
     }
     artifacts.forEach((artifact) => {
       const category = artifactCategory(artifact)
-      const groupKind = category === 'visual' ? 'visual' : category === 'chart' ? 'chart' : 'file'
+      const groupKind =
+        category === 'visual'
+          ? 'visual'
+          : category === 'chart'
+            ? 'chart'
+            : category === 'cards'
+              ? 'cards'
+              : 'file'
       if (groupKind !== openGroup) {
         closeGroup()
         html +=
@@ -290,7 +302,9 @@ export function createArtifactRenderer(deps: ArtifactRendererDeps) {
             ? '<div class="msg-artifact-gallery">'
             : groupKind === 'chart'
               ? '<div class="msg-artifact-charts">'
-              : '<div class="msg-artifact-files">'
+              : groupKind === 'cards'
+                ? '<div class="msg-artifact-cards-group">'
+                : '<div class="msg-artifact-files">'
         openGroup = groupKind
       }
       const name = artifactName(artifact)
@@ -320,6 +334,20 @@ export function createArtifactRenderer(deps: ArtifactRendererDeps) {
           <div class="msg-artifact-chart__readout"></div>
           <div class="msg-artifact-chart__canvas"></div>
           <p class="msg-artifact-chart__status">${escAttr(t('chat.chartLoading'))}</p>
+        </div>`
+      } else if (category === 'cards') {
+        // A mount placeholder, not a finished grid: the cards mounter fetches
+        // `data-cards-src` and builds the cards into `__grid`. No download
+        // affordance — the payload is an internal render format, not a file the
+        // user asked for, so `data-artifact-download` stays off deliberately.
+        const payloadUrl = artifactPreviewUrl(artifact || {}, { sessionKey, token })
+        html += `<div class="msg-artifact-cards" data-cards-src="${escAttr(payloadUrl)}" data-artifact-category="${escAttr(category)}" data-artifact-id="${escAttr(artifact?.id || '')}" data-artifact-name="${escAttr(name)}">
+          <div class="msg-artifact-cards__header">
+            <span class="msg-artifact-cards__name">${esc(name)}</span>
+          </div>
+          <div class="msg-artifact-cards__grid"></div>
+          <p class="msg-artifact-cards__overflow" hidden></p>
+          <p class="msg-artifact-cards__status">${escAttr(t('chat.cardsLoading'))}</p>
         </div>`
       } else if (isImageArtifact(artifact)) {
         const previewUrl = artifactPreviewUrl(artifact || {}, { sessionKey, token })

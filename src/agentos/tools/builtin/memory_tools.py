@@ -805,13 +805,13 @@ def create_memory_tools(
             "It does not search raw turn captures or raw fallback files. Returns "
             "top snippets with source, path, and lines. Use memory_get only for "
             "source=memory results; source=sessions results are virtual snippets. "
-            "Set source=memory for curated decisions/facts, source=sessions for "
-            "indexed transcript snippets when session source is enabled, or "
-            "source=all for both. Use session_search only when exact transcript "
-            "full-text search is needed. User identity/profile fields such as "
-            "name, preferred address, and pronouns belong in injected "
-            "USER.md when present. Do not use memory_search for current user "
-            "identity/profile questions when injected USER.md contains the answer."
+            "Set source=memory for curated decisions/facts, source=knowledge_base "
+            "for ingested notes and documents, source=sessions for indexed transcript "
+            "snippets when session source is enabled, or source=all for all sources. "
+            "Use session_search only when exact transcript full-text search is needed. "
+            "User identity/profile fields such as name, preferred address, and pronouns "
+            "belong in injected USER.md when present. Do not use memory_search for current "
+            "user identity/profile questions when injected USER.md contains the answer."
         ),
         params={
             "query": {"type": "string", "description": "Search query"},
@@ -825,7 +825,9 @@ def create_memory_tools(
             },
             "source": {
                 "type": "string",
-                "description": "Search source: 'memory' (default), 'sessions', or 'all'",
+                "description": (
+                    "Search source: 'memory' (default), 'knowledge_base', 'sessions', or 'all'"
+                ),
             },
         },
         required=["query"],

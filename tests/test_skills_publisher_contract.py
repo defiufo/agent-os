@@ -272,4 +272,8 @@ def test_other_bundled_skills_stay_unbranded(tmp_path: Path) -> None:
 
     branded = {skill.name for skill in loader.load_all() if skill.publisher != SkillPublisher()}
 
-    assert branded == {"robinhood-agentic-trading", "robinhood-rwa-addresses"}
+    assert branded == {
+        "robinhood-agentic-trading",
+        "robinhood-chain-stocks",
+        "robinhood-rwa-addresses",
+    }

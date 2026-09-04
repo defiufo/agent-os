@@ -6,6 +6,7 @@ import pytest
 
 from agentos.gateway.config import (
     DiscordChannelEntry,
+    EmailChannelEntry,
     SlackChannelEntry,
     TelegramChannelEntry,
 )
@@ -18,10 +19,11 @@ from agentos.onboarding.channel_specs import (
 
 # msteams is intentionally absent: the adapter is text-only and hidden
 # from runtime catalog surfaces until first-class support lands.
-ALL_TYPES = {"discord", "slack", "telegram"}
+ALL_TYPES = {"discord", "email", "slack", "telegram"}
 
 ENTRY_MODELS = {
     "slack": SlackChannelEntry,
+    "email": EmailChannelEntry,
     "discord": DiscordChannelEntry,
     "telegram": TelegramChannelEntry,
 }
@@ -71,6 +73,21 @@ def test_slack_secrets_are_marked_secret():
     spec = get_channel_setup_spec("slack")
     secrets = {f.name for f in spec.fields if f.secret}
     assert {"token", "app_token", "manifest_token", "signing_secret"} <= secrets
+
+
+def test_email_secrets_are_marked_secret():
+    spec = get_channel_setup_spec("email")
+    secrets = {f.name for f in spec.fields if f.secret}
+    assert {"imap_password", "smtp_password"} <= secrets
+
+
+def test_email_requires_an_explicit_sender_allowlist():
+    spec = get_channel_setup_spec("email")
+    fields = {f.name: f for f in spec.fields}
+
+    assert fields["allowed_senders"].required is True
+    assert spec.transport == "polling"
+    assert spec.requires_public_url is False
 
 
 def test_telegram_secrets_are_marked_secret():

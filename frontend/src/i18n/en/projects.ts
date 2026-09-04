@@ -10,6 +10,11 @@ export const projects = defineNamespace('projects', {
   refreshBusy: 'Refreshing…',
   newProject: 'New project',
 
+  // Loading / error states.
+  loadingLabel: 'Loading projects…',
+  errorTitle: 'Projects failed to load',
+  errorRetry: 'Retry',
+
   // Empty states.
   emptyTitle: 'No projects yet',
   emptyBody:
@@ -46,6 +51,8 @@ export const projects = defineNamespace('projects', {
   saveName: 'Save name',
   knowledgeSave: 'Save knowledge',
   knowledgeSaved: 'Knowledge saved',
+  knowledgeCounter: '{count} / {max} characters',
+  unsavedChanges: 'Unsaved changes',
   deleteProject: 'Delete project',
 
   // Delete confirm.
@@ -60,6 +67,8 @@ export const projects = defineNamespace('projects', {
   toastCreateFailed: 'Failed to create project: {message}',
   toastUpdated: 'Project updated',
   toastUpdateFailed: 'Failed to update project: {message}',
+  toastUpdateConflict:
+    'This project changed elsewhere — latest version loaded, your draft is kept. Review and save again.',
   toastDeleted: 'Project deleted',
   toastDeleteFailed: 'Failed to delete project: {message}',
   toastSessionCreated: 'Session created in project',

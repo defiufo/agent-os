@@ -365,11 +365,16 @@ export class ApprovalMonitor {
 /**
  * approval_monitor.js:67 — the poll endpoint. Legacy fetched the ROOT-absolute
  * '/api/approvals'; these routes are registered at the gateway root (app.py:
- * 535-537), NOT under control_ui.base_path, and the rate-limit exemption keys
- * off the bare '/api/approvals' (middleware.py:240). So — unlike /api/bootstrap
- * which lives under base_path — the approvals REST surface is root-absolute and
- * must NOT be rewritten through the BASE_URL-derived base. We keep the legacy
+ * 535-537), NOT under control_ui.base_path, and the gateway's dedicated
+ * approvals rate-limit bucket keys off the bare '/api/approvals'
+ * (middleware.py, _APPROVALS_PATH). So — unlike /api/bootstrap which lives
+ * under base_path — the approvals REST surface is root-absolute and must NOT
+ * be rewritten through the BASE_URL-derived base. We keep the legacy
  * root-absolute path verbatim.
+ *
+ * That bucket is generous (rate_limit.approvals_max_requests, default 300/min)
+ * but it is a bound, not an exemption: POLL_MS below is what keeps this poll
+ * comfortably under it.
  */
 export function approvalsUrl(): string {
   return '/api/approvals'

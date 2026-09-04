@@ -1,6 +1,6 @@
 [project]
 name = "use-agent-os"
-version = "2026.8.28"
+version = "2026.9.4"
 description = "Local-first agentic trading AI agent with on-device Pilot Router"
 license = "Apache-2.0"
 license-files = ["LICENSE", "NOTICE", "THIRD_PARTY_NOTICES.md"]
@@ -275,6 +275,23 @@ select = ["E", "F", "I", "N", "W", "UP"]
     "E702",
     "F541",
     "I001",
+]
+# Same bargain for the two wallet analyzers vendored from the same upstream:
+# gmgn-wallet-score keeps GMGN's one-line-per-branch style, gmgn-wallet-analysis
+# keeps its own naming and long report strings.
+"src/agentos/skills/bundled/gmgn-wallet-score/scripts/*.py" = [
+    "E401",
+    "E501",
+    "E701",
+    "I001",
+]
+"src/agentos/skills/bundled/gmgn-wallet-analysis/scripts/*.py" = [
+    "E501",
+    "F401",
+    "N802",
+    "N806",
+    "N818",
+    "UP034",
 ]
 "src/agentos/skills/bundled/video-still-animator/scripts/*.py" = ["E501"]
 

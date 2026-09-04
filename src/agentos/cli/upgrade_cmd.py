@@ -103,7 +103,14 @@ def _run_upgrade_subprocess(
         stdout, stderr = proc.communicate(timeout=timeout)
     except subprocess.TimeoutExpired:
         _kill_process_group(proc)
-        stdout, stderr = proc.communicate()
+        try:
+            stdout, stderr = proc.communicate(timeout=5.0)
+        except subprocess.TimeoutExpired:
+            # The tree is dead, but orphaned grandchildren can keep the
+            # inherited stdout/stderr pipe handles open, so communicate() would
+            # block past the timeout it was supposed to enforce. Don't let a
+            # stuck handle hang the CLI — give up on the streams.
+            stdout, stderr = "", ""
         return UpgradeRunResult(
             ok=False,
             timed_out=True,
@@ -123,7 +130,14 @@ def _run_upgrade_subprocess(
 
 def _kill_process_group(proc: subprocess.Popen[str]) -> None:
     if os.name == "nt":
-        proc.kill()
+        try:
+            subprocess.run(
+                ["taskkill", "/T", "/F", "/PID", str(proc.pid)],
+                capture_output=True,
+                timeout=5,
+            )
+        except (subprocess.TimeoutExpired, OSError):
+            proc.kill()
         return
     try:
         pgid = os.getpgid(proc.pid)  # type: ignore[attr-defined]

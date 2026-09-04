@@ -50,6 +50,11 @@ class IncomingMessage(BaseModel):
     - ``interaction_type``: explicit native interaction kind, such as
       ``slash_command``.
     - ``is_group``: bool consumed by ``ChannelManager`` for session keys.
+    - ``dm_thread_scoped``: bool opt-in for adapters whose DM surface is
+      itself threaded (email). When true, ``ChannelManager`` appends
+      ``native_thread_id`` to the DM session key so each thread is its own
+      session. Adapters that merely carry a thread id on a DM leave it unset
+      and keep one session per peer.
     """
 
     sender_id: str

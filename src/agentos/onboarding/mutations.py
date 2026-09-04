@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import functools
+import ipaddress
 import os
+import socket
 from dataclasses import dataclass, field
 from typing import Any, Literal, cast
 
@@ -417,6 +419,114 @@ def _validate_judge_base_url(base_url: str) -> None:
         )
 
 
+#: Hostnames that answer for a cloud metadata service. Kept in step with
+#: ``agentos.tools.ssrf``, duplicated rather than imported because the
+#: architecture contract keeps ``onboarding`` independent of ``tools``.
+_METADATA_HOSTNAMES: frozenset[str] = frozenset(
+    {
+        "metadata.google.internal",
+        "metadata.goog",
+        "instance-data",
+    }
+)
+
+#: Addresses that serve instance credentials. The link-local ones are already
+#: covered by the link-local check below; Alibaba Cloud's endpoint sits in a
+#: public range and would otherwise pass.
+_METADATA_ADDRESSES: frozenset[str] = frozenset(
+    {
+        "169.254.169.254",  # AWS / GCP / Azure / DO / Oracle
+        "169.254.169.253",  # Azure IMDS wire server
+        "169.254.170.2",  # AWS ECS task role credentials
+        "100.100.100.200",  # Alibaba Cloud
+        "fd00:ec2::254",  # AWS metadata over IPv6
+    }
+)
+
+
+def _parse_ip_literal(hostname: str) -> ipaddress.IPv4Address | ipaddress.IPv6Address | None:
+    """Return the IP address *hostname* denotes, or ``None`` if it is a name.
+
+    ``ipaddress`` only accepts dotted-quad IPv4, but the C resolver httpx ends
+    up on also accepts the ``inet_aton`` forms — ``2852039166``, ``0251.0376.
+    0251.0376``, ``0xA9.0xFE.0xA9.0xFE`` all reach 169.254.169.254. Reading
+    those as ordinary hostnames would hand the metadata endpoint a free pass,
+    so fall back to ``inet_aton``, which rejects a real hostname.
+    """
+    try:
+        return ipaddress.ip_address(hostname)
+    except ValueError:
+        pass
+    try:
+        packed = socket.inet_aton(hostname)
+    except OSError:
+        return None
+    return ipaddress.IPv4Address(packed)
+
+
+def _validate_provider_base_url(base_url: str) -> None:
+    """Validate an operator-supplied LLM provider ``base_url``.
+
+    Every completion request goes to this URL carrying the provider
+    ``Authorization`` header, so an unvalidated value handed to the RPC
+    (``onboarding.provider.configure``) or the CLI redirects credentials to a
+    host of the caller's choosing. Require an absolute http(s) URL — this also
+    keeps non-network schemes such as ``file://`` away from the httpx client —
+    and reject the destinations that are never a legitimate provider endpoint:
+    cloud metadata services and private / link-local / reserved IP literals.
+
+    Loopback stays allowed: a local model server (Ollama, vLLM, LM Studio) is
+    the common reason to set a base_url at all. Hostnames are not resolved
+    here; the resolved address is a connect-time concern tracked separately.
+    """
+    from urllib.parse import urlparse
+
+    malformed = ValueError(
+        "base_url must be an absolute http(s) URL (e.g. https://openrouter.ai/api/v1)"
+    )
+    try:
+        # ``urlparse`` raises "Invalid IPv6 URL" on an unterminated literal
+        # such as ``http://[::1``.
+        parsed = urlparse(base_url)
+        raw_hostname = parsed.hostname
+    except ValueError as exc:
+        raise malformed from exc
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        raise malformed
+    hostname = (raw_hostname or "").strip().lower().rstrip(".")
+    if not hostname:
+        raise ValueError("base_url must include a hostname")
+    if hostname in _METADATA_HOSTNAMES:
+        raise ValueError(
+            f"base_url host {hostname!r} is a cloud metadata endpoint, "
+            "which is never a valid LLM provider"
+        )
+
+    addr = _parse_ip_literal(hostname)
+    if addr is None:
+        return
+    if isinstance(addr, ipaddress.IPv6Address) and addr.ipv4_mapped is not None:
+        # ``::ffff:169.254.169.254`` is the same endpoint wearing another hat.
+        addr = addr.ipv4_mapped
+    if str(addr) in _METADATA_ADDRESSES:
+        raise ValueError(
+            f"base_url host {hostname!r} is a cloud metadata endpoint, "
+            "which is never a valid LLM provider"
+        )
+    if addr.is_loopback:
+        return
+    if addr.is_link_local:
+        raise ValueError(
+            f"base_url host {hostname!r} is a link-local address (cloud metadata "
+            "range), which is never a valid LLM provider"
+        )
+    if addr.is_private or addr.is_reserved or addr.is_multicast:
+        raise ValueError(
+            f"base_url host {hostname!r} is a private/reserved address; an LLM "
+            "provider must be a public host or loopback"
+        )
+
+
 def _verify_local_judge_endpoint(base_url: str, model: str, api_key: str) -> None:
     """Probe a local judge endpoint with one test classification (spec D2).
 
@@ -533,6 +643,14 @@ def upsert_llm_provider(
         if saved_profile is not None
         else (config.llm.base_url if active_provider == provider_id else "")
     )
+    # Validate only a *new* destination. A base_url restored from a saved
+    # profile or from the provider spec's default is trusted config, and the
+    # onboarding import path (``flow.py``) replays the already-persisted value
+    # as an explicit argument — re-checking either would turn an unrelated edit
+    # into a hard failure on a config the operator never typed.
+    base_url = str(base_url or "").strip()
+    if base_url and base_url != str(saved_base_url or "").strip():
+        _validate_provider_base_url(base_url)
     effective_base_url = base_url or saved_base_url or spec.default_base_url
     if spec.requires_base_url and not effective_base_url:
         raise ValueError(f"provider {provider_id!r} requires a base_url")

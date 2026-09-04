@@ -20,6 +20,7 @@ from agentos.result_budget import (
 from agentos.sandbox.integration import sandboxed
 from agentos.tools.registry import tool
 from agentos.tools.ssrf import validate_http_url_for_fetch
+from agentos.tools.ssrf_client import ssrf_guarded_client
 from agentos.tools.types import SSRFBlockedError, current_tool_context
 
 log = structlog.get_logger(__name__)
@@ -53,6 +54,17 @@ _RETRY_DELAY_SECONDS = 0.25
 _WEB_FETCH_DEFAULT_MAX_CHARS = 20_000
 _WEB_FETCH_MAX_CHARS_ENV = "AGENTOS_WEB_FETCH_MAX_CHARS"
 _MAX_REDIRECTS = 5
+
+# Hard ceiling on the number of response bytes web_fetch will buffer into
+# memory, independent of the display cap (max_chars). max_chars only truncates
+# what the model sees; without a download cap, a single unbounded response
+# body (chunked encoding with no content-length, or a lying content-length) is
+# read fully into RAM via response.text, so one malicious URL can exhaust the
+# process. 1 MiB covers every realistic page; the display cap then decides how
+# much of that is returned.
+_WEB_FETCH_DOWNLOAD_LIMIT_BYTES = 1_048_576
+_WEB_FETCH_DOWNLOAD_LIMIT_ENV = "AGENTOS_WEB_FETCH_DOWNLOAD_LIMIT"
+_STREAM_CHUNK_BYTES = 65_536
 
 
 def _check_ssrf(url: str) -> None:
@@ -132,6 +144,18 @@ def _resolve_default_max_chars() -> int:
     except ValueError:
         return _WEB_FETCH_DEFAULT_MAX_CHARS
     return value if value >= 100 else _WEB_FETCH_DEFAULT_MAX_CHARS
+
+
+def _resolve_download_limit_bytes() -> int:
+    """Resolve the hard download cap from env or the built-in default."""
+    raw = os.environ.get(_WEB_FETCH_DOWNLOAD_LIMIT_ENV, "").strip()
+    if not raw:
+        return _WEB_FETCH_DOWNLOAD_LIMIT_BYTES
+    try:
+        value = int(raw)
+    except ValueError:
+        return _WEB_FETCH_DOWNLOAD_LIMIT_BYTES
+    return value if value >= 65_536 else _WEB_FETCH_DOWNLOAD_LIMIT_BYTES
 
 
 def _resolve_effective_max_chars(max_chars: int | None) -> int | None:
@@ -219,44 +243,79 @@ async def web_fetch(
     final_url = url
     status = 0
     raw_html = ""
+    body_truncated = False
 
-    async def _do_fetch(user_agent: str) -> tuple[int, str, str, str]:
+    async def _do_fetch(user_agent: str) -> tuple[int, str, str, str, bool]:
         headers = dict(_DEFAULT_HEADERS)
         headers["User-Agent"] = user_agent
-        async with httpx.AsyncClient(
+        # The guarded client re-validates at connect time, so the address this
+        # socket dials is the one _check_ssrf approved — a rebinding domain
+        # cannot answer differently for the guard and for the connection.
+        async with ssrf_guarded_client(
             timeout=30.0,
             follow_redirects=False,
             trust_env=_trust_env(),
             headers=headers,
         ) as client:
             current_url = url
+            response: httpx.Response | None = None
             for _redirect_count in range(_MAX_REDIRECTS + 1):
                 _check_ssrf(current_url)
                 marker = _sensitive_url_marker(current_url)
                 if marker is not None:
                     raise ValueError("Blocked redirect URL containing sensitive data")
 
-                response = await client.get(current_url)
+                response = await client.send(client.build_request("GET", current_url), stream=True)
                 if response.status_code not in {301, 302, 303, 307, 308}:
                     break
                 location = response.headers.get("location")
                 if not location:
                     break
+                await response.aclose()
                 current_url = urljoin(str(response.url), location)
             else:
                 raise ValueError(f"Too many redirects (>{_MAX_REDIRECTS})")
 
-            return (
-                response.status_code,
-                str(response.url),
-                response.headers.get("content-type", ""),
-                response.text,
-            )
+            assert response is not None
+            try:
+                # Stream the body with a hard byte ceiling so an unbounded
+                # response can never be buffered fully into memory; max_chars
+                # only caps what is returned to the model, not what is
+                # downloaded.
+                download_limit = _resolve_download_limit_bytes()
+                # Snapshot the charset advertised in Content-Type before we
+                # start streaming — httpx derives response.encoding from
+                # those headers, and we have to honour the server's charset
+                # (e.g. text/plain; charset=iso-8859-1) instead of assuming
+                # UTF-8. Falling back to utf-8 matches httpx's own default.
+                response_encoding = response.encoding or "utf-8"
+                total = 0
+                chunks: list[bytes] = []
+                truncated = False
+                async for chunk in response.aiter_bytes(_STREAM_CHUNK_BYTES):
+                    chunks.append(chunk)
+                    total += len(chunk)
+                    if total >= download_limit:
+                        truncated = True
+                        break
+
+                raw_body = b"".join(chunks)
+                raw_text = raw_body.decode(response_encoding, errors="replace")
+
+                return (
+                    response.status_code,
+                    str(response.url),
+                    response.headers.get("content-type", ""),
+                    raw_text,
+                    truncated,
+                )
+            finally:
+                await response.aclose()
 
     last_error: str | None = None
     for attempt_idx, user_agent in enumerate((_UA_PRIMARY, _UA_FALLBACK)):
         try:
-            status, final_url, content_type, raw_html = await _do_fetch(user_agent)
+            status, final_url, content_type, raw_html, body_truncated = await _do_fetch(user_agent)
         except SSRFBlockedError:
             raise
         except httpx.TimeoutException:
@@ -299,7 +358,7 @@ async def web_fetch(
             "title": "",
             "extract_mode": extract_mode,
             "extractor": "raw",
-            "truncated": False,
+            "truncated": body_truncated,
             "length": len(raw_html),
             "text": _wrap_content(final_url, raw_html),
         }
@@ -374,7 +433,7 @@ async def web_fetch(
         "title": title,
         "extract_mode": extract_mode,
         "extractor": extractor_used,
-        "truncated": False,
+        "truncated": body_truncated,
         "length": len(extracted_content),
         "text": _wrap_content(final_url, extracted_content),
     }

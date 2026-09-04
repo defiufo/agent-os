@@ -193,4 +193,16 @@ describe('shortPath', () => {
   it('handles an absent path', () => {
     expect(shortPath(undefined)).toBe('')
   })
+
+  it('shortens a Windows path', () => {
+    expect(shortPath('C:\\Users\\username\\.agentos\\.env')).toBe('…/.agentos/.env')
+  })
+
+  it('leaves an already-short Windows path alone', () => {
+    expect(shortPath('C:\\.env')).toBe('C:\\.env')
+  })
+
+  it('shortens a mixed-separator path', () => {
+    expect(shortPath('C:\\Users\\me/projects/app/.env')).toBe('…/app/.env')
+  })
 })

@@ -144,6 +144,7 @@ from agentos.provider import (
 )
 from agentos.provider import (
     ProviderFailureKind,
+    ProviderHeartbeatEvent,
     ProviderRecoveryAction,
     classify_provider_error,
     decide_recovery_action,
@@ -1096,6 +1097,24 @@ def _drop_unpaired_tool_use_segments(segments: list[dict[str, Any]]) -> list[dic
     ]
 
 
+def _selector_model_name(provider: Any, selector: Any) -> str:
+    m = getattr(provider, "_model", None) or getattr(provider, "model", None)
+    if not m:
+        cfg = getattr(selector, "current_config", None)
+        m = getattr(cfg, "model", "") if cfg is not None else ""
+    return str(m or "")
+
+
+def _selector_has_fallback(selector: Any) -> bool:
+    fn = getattr(selector, "has_fallback", None)
+    if callable(fn):
+        try:
+            return bool(fn())
+        except Exception:
+            return False
+    return False
+
+
 class _SelectorFallbackProvider:
     """Provider wrapper that switches to selector fallback on pre-content errors.
 
@@ -1179,6 +1198,7 @@ class _SelectorFallbackProvider:
                     recorded_failure = trips_breaker(kind)
                     self._record_failure(kind, event.message)
                 if _kind_uses_selector_fallback(kind):
+                    failed_model = _selector_model_name(self._provider, self._selector)
                     try:
                         self._provider = self._selector.next_fallback_after_failure(
                             RuntimeError(event.message)
@@ -1188,6 +1208,14 @@ class _SelectorFallbackProvider:
                             yield buffered_event
                         yield event
                         return
+                    fallback_model = _selector_model_name(self._provider, self._selector)
+                    yield ProviderHeartbeatEvent(
+                        phase="llm_fallback",
+                        message=(
+                            f"Model {failed_model or 'primary'} failed; "
+                            f"automatically switching to fallback model {fallback_model}."
+                        ),
+                    )
                     async for fallback_event in self._fallback_chat(messages, tools, config):
                         yield fallback_event
                     return
@@ -1239,6 +1267,25 @@ class _SelectorFallbackProvider:
                     kind = _classify_provider_event(self.provider_name, event)
                     recorded_failure = trips_breaker(kind)
                     self._record_failure(kind, event.message)
+                if _kind_uses_selector_fallback(kind) and _selector_has_fallback(self._selector):
+                    failed_model = _selector_model_name(self._provider, self._selector)
+                    try:
+                        self._provider = self._selector.next_fallback_after_failure(
+                            RuntimeError(event.message)
+                        )
+                        fallback_model = _selector_model_name(self._provider, self._selector)
+                        yield ProviderHeartbeatEvent(
+                            phase="llm_fallback",
+                            message=(
+                                f"Model {failed_model or 'fallback'} failed; "
+                                f"automatically switching to fallback model {fallback_model}."
+                            ),
+                        )
+                        async for next_ev in self._fallback_chat(messages, tools, config):
+                            yield next_ev
+                        return
+                    except Exception:
+                        pass
             elif not recorded_success and (
                 _is_non_empty_provider_text_delta(event)
                 or (getattr(event, "kind", "") == "done" and not saw_provider_error)
@@ -1505,6 +1552,80 @@ def _claims_image_without_tool_use(
         return False
     lowered = final_text.lower()
     return any(p.lower() in lowered for p in _IMAGE_CLAIM_PATTERNS)
+
+
+def _derive_router_tier_fallbacks(
+    turn: TurnContext,
+    cloned_selector: Any,
+) -> list[Any] | None:
+    """Derive fallback provider configs from the router's active tiers.
+
+    When Auto Pilot selects a model for a turn, other configured text tiers in the
+    active profile serve as automatic failovers if the routed model fails (e.g.
+    times out or encounters upstream errors).
+    """
+    if not turn.metadata.get("routing_applied"):
+        return None
+    routed_tier = turn.metadata.get("routed_tier")
+    if not routed_tier:
+        return None
+    router_cfg = getattr(turn.config, "agentos_router", None)
+    if router_cfg is None or not getattr(router_cfg, "enabled", False):
+        return None
+    tiers = getattr(router_cfg, "tiers", None)
+    if not isinstance(tiers, dict) or not tiers:
+        return None
+
+    tier_preferences = {
+        "c0": ["c1", "c2", "c3"],
+        "c1": ["c2", "c0", "c3"],
+        "c2": ["c1", "c3", "c0"],
+        "c3": ["c2", "c1", "c0"],
+    }
+    preferred_order = tier_preferences.get(str(routed_tier).lower(), ["c1", "c2", "c0", "c3"])
+    candidate_tiers = [t for t in preferred_order if t in tiers and t != routed_tier]
+    for t in tiers:
+        if t not in candidate_tiers and t != routed_tier:
+            candidate_tiers.append(t)
+
+    primary_cfg = getattr(cloned_selector, "current_config", None)
+    if primary_cfg is None and hasattr(cloned_selector, "_chain") and cloned_selector._chain:
+        primary_cfg = cloned_selector._chain[0]
+    if primary_cfg is None:
+        return None
+
+    from agentos.provider.selector import ProviderConfig
+
+    fallbacks: list[ProviderConfig] = []
+    seen_models: set[str] = {turn.model or primary_cfg.model}
+
+    for tier_name in candidate_tiers:
+        tier_data = tiers.get(tier_name)
+        if not isinstance(tier_data, dict):
+            continue
+        if tier_data.get("image_only"):
+            continue
+        candidate_model = tier_data.get("model")
+        if not candidate_model or candidate_model in seen_models:
+            continue
+        seen_models.add(candidate_model)
+
+        candidate_provider = str(
+            tier_data.get("provider") or getattr(primary_cfg, "provider", "") or ""
+        )
+        fallbacks.append(
+            ProviderConfig(
+                provider=candidate_provider,
+                model=candidate_model,
+                api_key=getattr(primary_cfg, "api_key", ""),
+                base_url=getattr(primary_cfg, "base_url", ""),
+                org_id=getattr(primary_cfg, "org_id", ""),
+                proxy=getattr(primary_cfg, "proxy", ""),
+                provider_routing=getattr(primary_cfg, "provider_routing", {}),
+            )
+        )
+
+    return fallbacks if fallbacks else None
 
 
 class TurnRunner:
@@ -1886,9 +2007,11 @@ class TurnRunner:
         merged["Memory Context"] = block
         return merged
 
-    # Injection ceiling for project knowledge. Writes are already capped at
-    # SessionManager.PROJECT_KNOWLEDGE_MAX_CHARS; this second cap only guards
-    # rows written before that limit existed (or edited out-of-band).
+    # Injection ceiling for project knowledge. Kept equal to
+    # SessionManager.PROJECT_KNOWLEDGE_MAX_CHARS (a release-consistency test
+    # asserts this) so nothing that saves is silently cut here; the guard
+    # still truncates rows written under the old, larger write cap or edited
+    # out-of-band.
     PROJECT_KNOWLEDGE_INJECT_MAX_CHARS = 24_000
 
     async def _augment_extra_context_with_project_knowledge(
@@ -4631,7 +4754,11 @@ class TurnRunner:
 
         # Apply routed model back to cloned selector (local, not shared)
         if turn.model and cloned_selector is not None:
-            cloned_selector.override_model(turn.model)
+            tier_fallbacks = _derive_router_tier_fallbacks(turn, cloned_selector)
+            try:
+                cloned_selector.override_model(turn.model, fallbacks=tier_fallbacks)
+            except TypeError:
+                cloned_selector.override_model(turn.model)
             provider = cloned_selector.resolve()
 
         return turn, provider

@@ -23,6 +23,7 @@ class RouterSetupProfile:
 
 _PROFILE_LABELS: dict[str, str] = {
     "openrouter": "OpenRouter mixed defaults",
+    "surplus": "Surplus Intelligence",
     "dashscope": "Aliyun DashScope",
     "deepseek": "DeepSeek",
     "gemini": "Google Gemini",

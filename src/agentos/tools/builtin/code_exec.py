@@ -25,8 +25,8 @@ from agentos.tools.types import ToolError, current_tool_context
 
 # Destructive Python patterns that must go through the same approval flow as
 # shell warnlist hits. Catches the "agent pivots from `rm` to `os.remove()`"
-# bypass. Matching is intentionally shallow (regex, not AST) — goal is to
-# force approval on obvious intent, not to prove safety.
+# bypass. We scan using shallow regex (fast-path) plus AST analysis to catch
+# dynamic evasion (getattr, __import__, importlib, exec/eval, and wildcard imports).
 _DESTRUCTIVE_PY_PATTERNS: list[tuple[str, str]] = [
     (r"\bos\.remove\s*\(", "os.remove()"),
     (r"\bos\.unlink\s*\(", "os.unlink()"),
@@ -46,13 +46,209 @@ _DESTRUCTIVE_PY_PATTERNS: list[tuple[str, str]] = [
     ),
 ]
 
+_OS_DESTRUCTIVE_ATTRS: frozenset[str] = frozenset({"remove", "unlink", "rmdir", "removedirs"})
+_SHUTIL_DESTRUCTIVE_ATTRS: frozenset[str] = frozenset({"rmtree", "rmdir"})
+_PATH_DESTRUCTIVE_ATTRS: frozenset[str] = frozenset({"unlink", "rmdir"})
+_ALL_DESTRUCTIVE_NAMES: frozenset[str] = frozenset(
+    {"remove", "unlink", "rmdir", "removedirs", "rmtree"}
+)
+_SUBPROCESS_CALL_NAMES: frozenset[str] = frozenset(
+    {"run", "call", "Popen", "check_output", "check_call"}
+)
+
+
+def _eval_const_str(node: ast.AST) -> str | None:
+    """Evaluate a statically resolvable string expression (literals, concat, f-strings)."""
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        return node.value
+    if isinstance(node, ast.FormattedValue):
+        return _eval_const_str(node.value)
+    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
+        left = _eval_const_str(node.left)
+        right = _eval_const_str(node.right)
+        if left is not None and right is not None:
+            return left + right
+    if isinstance(node, ast.JoinedStr):
+        parts: list[str] = []
+        for val in node.values:
+            part = _eval_const_str(val)
+            if part is None:
+                return None
+            parts.append(part)
+        return "".join(parts)
+    return None
+
+
+def _resolve_module_from_node(node: ast.AST, aliases: dict[str, str]) -> str | None:
+    """Return the canonical module name ('os', 'shutil', etc.) if node resolves to one."""
+    if isinstance(node, ast.Name):
+        return aliases.get(node.id, node.id)
+    if isinstance(node, ast.Call):
+        # __import__("os")
+        if isinstance(node.func, ast.Name) and node.func.id == "__import__" and node.args:
+            mod = _eval_const_str(node.args[0])
+            if mod:
+                return aliases.get(mod, mod)
+        # importlib.import_module("os")
+        if isinstance(node.func, ast.Attribute) and node.func.attr == "import_module":
+            mod_val = _resolve_module_from_node(node.func.value, aliases)
+            if mod_val == "importlib" and node.args:
+                mod = _eval_const_str(node.args[0])
+                if mod:
+                    return aliases.get(mod, mod)
+    return None
+
+
+class _DestructiveCodeVisitor(ast.NodeVisitor):
+    """AST visitor detecting obfuscated and dynamic destructive operations."""
+
+    def __init__(self) -> None:
+        self.warning: str | None = None
+        self.module_aliases: dict[str, str] = {
+            "os": "os",
+            "shutil": "shutil",
+            "pathlib": "pathlib",
+            "subprocess": "subprocess",
+            "importlib": "importlib",
+        }
+        self.destructive_funcs: dict[str, str] = {}
+
+    def visit_Import(self, node: ast.Import) -> None:
+        for alias in node.names:
+            target = alias.asname or alias.name
+            if alias.name in ("os", "shutil", "pathlib", "subprocess", "importlib"):
+                self.module_aliases[target] = alias.name
+        self.generic_visit(node)
+
+    def visit_ImportFrom(self, node: ast.ImportFrom) -> None:
+        mod = node.module or ""
+        canonical = self.module_aliases.get(mod, mod)
+        if canonical == "os":
+            for alias in node.names:
+                name = alias.name
+                target = alias.asname or name
+                if name == "*":
+                    for fn in _OS_DESTRUCTIVE_ATTRS:
+                        self.destructive_funcs[fn] = f"os.{fn}()"
+                elif name in _OS_DESTRUCTIVE_ATTRS:
+                    self.destructive_funcs[target] = f"os.{name}()"
+        elif canonical == "shutil":
+            for alias in node.names:
+                name = alias.name
+                target = alias.asname or name
+                if name == "*":
+                    for fn in _SHUTIL_DESTRUCTIVE_ATTRS:
+                        self.destructive_funcs[fn] = f"shutil.{fn}()"
+                elif name in _SHUTIL_DESTRUCTIVE_ATTRS:
+                    self.destructive_funcs[target] = f"shutil.{name}()"
+        self.generic_visit(node)
+
+    def visit_Call(self, node: ast.Call) -> None:
+        if self.warning is not None:
+            return
+
+        # 1. Direct function call: remove(), r(), etc.
+        if isinstance(node.func, ast.Name):
+            func_name = node.func.id
+            if func_name in self.destructive_funcs:
+                self.warning = (
+                    f"destructive Python operation detected: {self.destructive_funcs[func_name]}"
+                )
+                return
+
+            # 2. Dynamic getattr: getattr(os, "rem"+"ove"), getattr(Path, "unlink"), etc.
+            if func_name == "getattr" and len(node.args) >= 2:
+                attr_name = _eval_const_str(node.args[1])
+                if attr_name in _ALL_DESTRUCTIVE_NAMES:
+                    mod = _resolve_module_from_node(node.args[0], self.module_aliases)
+                    if mod == "os" and attr_name in _OS_DESTRUCTIVE_ATTRS:
+                        self.warning = (
+                            f"destructive Python operation detected: os.{attr_name}() via getattr"
+                        )
+                        return
+                    if mod == "shutil" and attr_name in _SHUTIL_DESTRUCTIVE_ATTRS:
+                        self.warning = (
+                            f"destructive Python operation detected: "
+                            f"shutil.{attr_name}() via getattr"
+                        )
+                        return
+                    if attr_name in _PATH_DESTRUCTIVE_ATTRS:
+                        self.warning = (
+                            f"destructive Python operation detected: Path.{attr_name}() via getattr"
+                        )
+                        return
+                    self.warning = (
+                        f"destructive Python operation detected: {attr_name}() via getattr"
+                    )
+                    return
+
+            # 3. eval() or exec() with embedded destructive code
+            if func_name in ("eval", "exec") and node.args:
+                inner_code = _eval_const_str(node.args[0])
+                if inner_code:
+                    inner_warning = _check_code_destructive(inner_code)
+                    if inner_warning:
+                        self.warning = (
+                            f"destructive Python operation detected: "
+                            f"{func_name}() with {inner_warning}"
+                        )
+                        return
+
+        # 4. Method call on an attribute: obj.method()
+        if isinstance(node.func, ast.Attribute):
+            attr_name = node.func.attr
+            mod = _resolve_module_from_node(node.func.value, self.module_aliases)
+
+            if mod == "os" and attr_name in _OS_DESTRUCTIVE_ATTRS:
+                self.warning = f"destructive Python operation detected: os.{attr_name}()"
+                return
+            if mod == "shutil" and attr_name in _SHUTIL_DESTRUCTIVE_ATTRS:
+                self.warning = f"destructive Python operation detected: shutil.{attr_name}()"
+                return
+            if attr_name in _PATH_DESTRUCTIVE_ATTRS:
+                self.warning = f"destructive Python operation detected: Path.{attr_name}()"
+                return
+
+            if mod == "os" and attr_name in ("system", "popen") and node.args:
+                cmd_str = _eval_const_str(node.args[0])
+                if cmd_str and re.search(r"\b(rm|rmdir)\b", cmd_str):
+                    self.warning = f"destructive Python operation detected: os.{attr_name} with rm"
+                    return
+
+            if mod == "subprocess" and attr_name in _SUBPROCESS_CALL_NAMES and node.args:
+                first_arg = node.args[0]
+                if isinstance(first_arg, ast.List):
+                    parts = [_eval_const_str(elt) for elt in first_arg.elts]
+                    if any(p in ("rm", "rmdir") for p in parts if p is not None):
+                        self.warning = (
+                            "destructive Python operation detected: subprocess invoking rm"
+                        )
+                        return
+                else:
+                    cmd_str = _eval_const_str(first_arg)
+                    if cmd_str and re.search(r"\b(rm|rmdir)\b", cmd_str):
+                        self.warning = (
+                            "destructive Python operation detected: subprocess invoking rm"
+                        )
+                        return
+
+        self.generic_visit(node)
+
 
 def _check_code_destructive(code: str) -> str | None:
     """Return a human-readable warning if *code* triggers a destructive pattern, else None."""
     for pattern, label in _DESTRUCTIVE_PY_PATTERNS:
         if re.search(pattern, code):
             return f"destructive Python operation detected: {label}"
-    return None
+
+    try:
+        tree = ast.parse(code)
+    except SyntaxError:
+        return None
+
+    visitor = _DestructiveCodeVisitor()
+    visitor.visit(tree)
+    return visitor.warning
 
 
 _CODE_SENSITIVE_READ_TOKENS = (
@@ -194,11 +390,35 @@ def _execution_result_json(
     timed_out: bool,
     elapsed_ms: int,
 ) -> str:
+    # Redact secrets from captured output before it reaches the model.
+    # shell.py does this on every output surface; execute_code must match the
+    # same egress policy (see redact.redact_terminal_output). A script that
+    # prints os.environ / a credential file would otherwise leak it raw.
+    #
+    # Redact BEFORE truncating: a credential straddling the output cap would
+    # otherwise be cut in half first, and the surviving prefix no longer
+    # matches the shape pattern, leaking a partial key.
+    #
+    # code_file=False is a deliberate divergence from redact_terminal_output,
+    # which passes code_file=not assignments (assignment pass only for env
+    # dumps / credential-file reads). execute_code output is arbitrary script
+    # output that routinely prints os.environ and credential files, so the
+    # assignment pass must run unconditionally here. The cost is that
+    # `api_key=*** in printed source becomes `api_key=*** — acceptable
+    # for a code-execution surface where real secrets are the norm.
+    from agentos.redact import redact_sensitive_text
+
+    redacted_stdout = redact_sensitive_text(stdout, force=True, code_file=False)
+    redacted_stderr = redact_sensitive_text(stderr, force=True, code_file=False)
     return json.dumps(
         {
             "exit_code": returncode,
-            "stdout": stdout[:_MAX_OUTPUT_CHARS],
-            "stderr": stderr[:_MAX_OUTPUT_CHARS],
+            "stdout": (redacted_stdout if redacted_stdout is not None else stdout)[
+                :_MAX_OUTPUT_CHARS
+            ],
+            "stderr": (redacted_stderr if redacted_stderr is not None else stderr)[
+                :_MAX_OUTPUT_CHARS
+            ],
             "timed_out": timed_out,
             "elapsed_ms": elapsed_ms,
         },

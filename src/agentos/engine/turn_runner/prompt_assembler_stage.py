@@ -40,6 +40,7 @@ if TYPE_CHECKING:
 # ``None`` and the pipeline branches on truthiness internally.
 # ---------------------------------------------------------------------------
 
+
 @dataclass(frozen=True)
 class RunPipelineRequest:
     """Typed input for ``PipelineExecutionPort.run_pipeline``.
@@ -68,12 +69,14 @@ class RunPipelineRequest:
     tool_context: ToolContext | None = None
     normalization_metadata: dict[str, Any] | None = None
 
+
 # ---------------------------------------------------------------------------
 # Ports — narrow Protocols so the stage is unit-testable without the full
 # TurnRunner. The runtime adapters in ``harness.py`` bind these to the
 # concrete TurnRunner methods (or to the module-level helper for prompt
 # report).
 # ---------------------------------------------------------------------------
+
 
 @runtime_checkable
 class PromptAssemblerPort(Protocol):
@@ -97,6 +100,7 @@ class PromptAssemblerPort(Protocol):
         fresh_user_session: bool = False,
     ) -> str | tuple[str, str]: ...
 
+
 @runtime_checkable
 class PipelineExecutionPort(Protocol):
     """Wraps ``TurnRunner._run_pipeline``.
@@ -112,6 +116,7 @@ class PipelineExecutionPort(Protocol):
         self,
         request: RunPipelineRequest,
     ) -> tuple[Any, Any]: ...
+
 
 @runtime_checkable
 class RouterContextPort(Protocol):
@@ -131,6 +136,7 @@ class RouterContextPort(Protocol):
         exclude_last_user: bool,
     ) -> dict[str, Any]: ...
 
+
 @runtime_checkable
 class PromptConfigResolverPort(Protocol):
     """Wraps ``TurnRunner._resolve_prompt_config``.
@@ -143,6 +149,7 @@ class PromptConfigResolverPort(Protocol):
         self,
         turn: Any,
     ) -> tuple[str, list[Any] | None, str | None]: ...
+
 
 @runtime_checkable
 class PromptReportBuilderPort(Protocol):
@@ -167,6 +174,7 @@ class PromptReportBuilderPort(Protocol):
         tool_profile: str | None,
     ) -> PromptReport: ...
 
+
 @runtime_checkable
 class SessionIdResolverPort(Protocol):
     """Wraps ``TurnRunner._resolve_session_id_for_log``.
@@ -181,6 +189,7 @@ class SessionIdResolverPort(Protocol):
         session_key: str,
     ) -> str | None: ...
 
+
 @runtime_checkable
 class MemoryFingerprintPort(Protocol):
     """Wraps ``TurnRunner._config.memory_mode_fingerprint`` if present.
@@ -192,9 +201,11 @@ class MemoryFingerprintPort(Protocol):
 
     def memory_mode_fingerprint(self) -> dict[str, str] | None: ...
 
+
 # ---------------------------------------------------------------------------
 # Stage I/O dataclasses (frozen)
 # ---------------------------------------------------------------------------
+
 
 @dataclass(frozen=True)
 class PromptAssemblerStageInput:
@@ -230,6 +241,7 @@ class PromptAssemblerStageInput:
     fresh_user_session: bool = False
     ingress_pipeline_steps: list[PipelineStepRecord] | None = None
     normalization_metadata: dict[str, Any] | None = None
+
 
 @dataclass(frozen=True)
 class PromptAssemblerStageOutput:
@@ -280,9 +292,11 @@ class PromptAssemblerStageOutput:
     selector_model: str
     agentos_router_tier: Any = None
 
+
 # ---------------------------------------------------------------------------
 # Stage
 # ---------------------------------------------------------------------------
+
 
 class PromptAssemblerStage:
     """Assemble identity prompt + run pre-turn pipeline + finalize prompt.
@@ -358,9 +372,7 @@ class PromptAssemblerStage:
         # 2. Fetch router context (transcript-driven)
         router_context = await self._router_context.fetch_router_context(
             inp.session_key,
-            exclude_last_user=(
-                inp.history_has_persisted_user or inp.persist_input
-            ),
+            exclude_last_user=(inp.history_has_persisted_user or inp.persist_input),
         )
 
         # 3. Run pre-turn pipeline (model routing, skills, prompt cache, etc.)
@@ -392,9 +404,7 @@ class PromptAssemblerStage:
         if fingerprint is not None:
             prompt_fingerprint = turn.metadata.get("memory_mode_fingerprint")
             if isinstance(prompt_fingerprint, dict):
-                fingerprint.update(
-                    {str(k): str(v) for k, v in prompt_fingerprint.items()}
-                )
+                fingerprint.update({str(k): str(v) for k, v in prompt_fingerprint.items()})
             turn.metadata["memory_mode_fingerprint"] = fingerprint
 
         # 6. Effective runtime message + selector override / fallback wrap
@@ -402,6 +412,23 @@ class PromptAssemblerStage:
         if inp.model and inp.cloned_selector is not None:
             inp.cloned_selector.override_model(inp.model)
             provider = inp.cloned_selector.resolve()
+        elif (
+            turn.model
+            and inp.cloned_selector is not None
+            and not (
+                callable(getattr(inp.cloned_selector, "has_fallback", None))
+                and inp.cloned_selector.has_fallback()
+            )
+        ):
+            from agentos.engine.runtime import _derive_router_tier_fallbacks
+
+            fallbacks = _derive_router_tier_fallbacks(turn, inp.cloned_selector)
+            if fallbacks:
+                try:
+                    inp.cloned_selector.override_model(turn.model, fallbacks=fallbacks)
+                except TypeError:
+                    inp.cloned_selector.override_model(turn.model)
+                provider = inp.cloned_selector.resolve()
         if inp.cloned_selector is not None:
             # Local import to avoid pulling _SelectorFallbackProvider name
             # into the stage's module-top namespace.
@@ -435,15 +462,19 @@ class PromptAssemblerStage:
         selector_model = ""
         if inp.cloned_selector is not None:
             try:
-                selector_model = (
-                    getattr(inp.cloned_selector.current_config, "model", "") or ""
-                )
+                selector_model = getattr(inp.cloned_selector.current_config, "model", "") or ""
             except Exception:  # noqa: BLE001 - defensive
                 selector_model = ""
         resolved_model = inp.model or turn.model or selector_model
-        provider_name = (
-            getattr(provider, "provider_name", "") or type(provider).__name__
-        )
+        # An explicit model beats the routed one above. Tell the router
+        # metadata so nothing downstream reports (or prices) a route the
+        # provider call never used. Local import for the same reason as
+        # ``_SelectorFallbackProvider`` above: the stage keeps engine
+        # imports off its module top level.
+        from agentos.engine.router_decision import reconcile_routing_metadata
+
+        reconcile_routing_metadata(turn.metadata, resolved_model)
+        provider_name = getattr(provider, "provider_name", "") or type(provider).__name__
 
         return StageOutcome.success(
             PromptAssemblerStageOutput(

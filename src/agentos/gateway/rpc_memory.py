@@ -12,6 +12,7 @@ from agentos.memory.types import (
     DEFAULT_MEMORY_SEARCH_MIN_SCORE,
     DEFAULT_MEMORY_SEARCH_RESULTS,
     MemorySearchOpts,
+    MemorySource,
     SearchIntent,
     normalize_memory_search_min_score,
     normalize_memory_source_filter,
@@ -254,38 +255,56 @@ def _result_to_wire(result: Any) -> dict[str, Any]:
     }
 
 
-
-
-
-
-
-def _memory_source_rows(root: Path) -> list[dict[str, Any]]:
+def _memory_source_rows(
+    root: Path,
+    source_filter: MemorySource | None = None,
+) -> list[dict[str, Any]]:
     resolved_root = root.resolve()
-    candidates: list[Path] = []
-    memory_md = resolved_root / "MEMORY.md"
-    if memory_md.is_file():
-        candidates.append(memory_md)
-    memory_dir = resolved_root / "memory"
-    if memory_dir.is_dir():
-        candidates.extend(path for path in memory_dir.rglob("*.md") if path.is_file())
+    candidates: list[tuple[Path, str]] = []
+
+    if source_filter is None or source_filter is MemorySource.memory:
+        memory_md = resolved_root / "MEMORY.md"
+        if memory_md.is_file():
+            candidates.append((memory_md, "memory"))
+        memory_dir = resolved_root / "memory"
+        if memory_dir.is_dir():
+            candidates.extend(
+                (path, "memory") for path in memory_dir.rglob("*.md") if path.is_file()
+            )
+
+    if source_filter is None or source_filter is MemorySource.knowledge_base:
+        kb_dir = resolved_root / "knowledge_base"
+        if kb_dir.is_dir():
+            candidates.extend(
+                (path, "knowledge_base") for path in kb_dir.rglob("*") if path.is_file()
+            )
 
     rows: list[dict[str, Any]] = []
     seen: set[str] = set()
-    for file_path in candidates:
+    for file_path, src_type in candidates:
         try:
             resolved_file = file_path.resolve()
             rel = resolved_file.relative_to(resolved_root).as_posix()
         except ValueError:
             continue
-        if rel in seen or not _is_memory_source_path(rel):
+        if rel in seen:
+            continue
+        if src_type == "memory" and not _is_memory_source_path(rel):
+            continue
+        if any(part.startswith(".") for part in Path(rel).parts):
             continue
         stat = resolved_file.stat()
-        with resolved_file.open("r", encoding="utf-8", errors="replace") as handle:
-            line_count = sum(1 for _ in handle)
+        line_count = 0
+        try:
+            with resolved_file.open("r", encoding="utf-8", errors="replace") as handle:
+                line_count = sum(1 for _ in handle)
+        except Exception:
+            pass
         seen.add(rel)
         rows.append(
             {
                 "path": rel,
+                "source": src_type,
                 "sizeBytes": stat.st_size,
                 "modifiedAt": datetime.fromtimestamp(stat.st_mtime, tz=UTC).isoformat(),
                 "lineCount": line_count,
@@ -313,8 +332,13 @@ async def _handle_memory_list(params: dict | None, ctx: RpcContext) -> dict[str,
     if params is not None and not isinstance(params, dict):
         raise ValueError("params must be an object")
     agent_id, manager = _require_memory_manager(ctx, (params or {}).get("agentId"))
+    source_raw = (params or {}).get("source")
+    try:
+        source_filter = normalize_memory_source_filter(source_raw, allow_all=True)
+    except ValueError as exc:
+        raise ValueError(str(exc)) from exc
     root = _memory_root(manager)
-    rows = _memory_source_rows(root)
+    rows = _memory_source_rows(root, source_filter=source_filter)
     return {"agentId": agent_id, "count": len(rows), "files": rows}
 
 
@@ -389,8 +413,17 @@ async def _handle_memory_index(params: dict | None, ctx: RpcContext) -> dict[str
 def _validate_memory_path(path: str) -> None:
     if not path.strip():
         raise ValueError("params.path is required")
-    if not _is_memory_source_path(path):
-        raise ValueError("params.path must be MEMORY.md or memory/**/*.md")
+    rel = Path(path.strip())
+    if rel.is_absolute() or any(part in {"", ".", ".."} for part in rel.parts):
+        raise ValueError("path traversal is not allowed")
+    if (
+        not _is_memory_source_path(path)
+        and rel.parts != ("USER.md",)
+        and not (len(rel.parts) >= 2 and rel.parts[0] == "knowledge_base")
+    ):
+        raise ValueError(
+            "params.path must be MEMORY.md, USER.md, memory/**/*.md, or knowledge_base/**/*"
+        )
 
 
 def _raw_fallback_rel_path(path: str) -> str:
@@ -593,5 +626,242 @@ async def _handle_raw_fallbacks_show(params: dict | None, ctx: RpcContext) -> di
     }
 
 
+# ── Curated memory management ──────────────────────────────────────────────────
 
 
+@_d.method("memory.curated.get")
+async def _handle_memory_curated_get(params: dict | None, ctx: RpcContext) -> dict[str, Any]:
+    params = params or {}
+    agent_id, manager = _require_memory_manager(ctx, params.get("agentId"))
+    target = str(params.get("target") or "memory").strip().lower()
+    if target not in ("memory", "user"):
+        raise ValueError("params.target must be 'memory' or 'user'")
+    store = manager.curated_store()
+    entries = store.entries_for(target)
+    limit = store.char_limit(target)
+    usage = store.usage_for(target)
+    char_count = store.char_count(target)
+    return {
+        "agentId": agent_id,
+        "target": target,
+        "entries": entries,
+        "usage": usage,
+        "charCount": char_count,
+        "charLimit": limit,
+        "loadFailed": bool(store.load_failed.get(target, False)),
+    }
+
+
+@_d.method("memory.curated.add")
+async def _handle_memory_curated_add(params: dict | None, ctx: RpcContext) -> dict[str, Any]:
+    if not isinstance(params, dict):
+        raise ValueError("params must be an object")
+    agent_id, manager = _require_memory_manager(ctx, params.get("agentId"))
+    target = str(params.get("target") or "memory").strip().lower()
+    if target not in ("memory", "user"):
+        raise ValueError("params.target must be 'memory' or 'user'")
+    content = str(params.get("content") or "").strip()
+    if not content:
+        raise ValueError("params.content is required")
+    store = manager.curated_store()
+    res = store.add(target, content)
+    if not res.get("success"):
+        raise ValueError(res.get("error") or "Failed to add curated entry")
+    return {
+        "agentId": agent_id,
+        "target": target,
+        "entries": store.entries_for(target),
+        "usage": store.usage_for(target),
+        "message": res.get("message", "Entry added."),
+    }
+
+
+@_d.method("memory.curated.replace")
+async def _handle_memory_curated_replace(params: dict | None, ctx: RpcContext) -> dict[str, Any]:
+    if not isinstance(params, dict):
+        raise ValueError("params must be an object")
+    agent_id, manager = _require_memory_manager(ctx, params.get("agentId"))
+    target = str(params.get("target") or "memory").strip().lower()
+    if target not in ("memory", "user"):
+        raise ValueError("params.target must be 'memory' or 'user'")
+    old_text = str(params.get("oldText") or "").strip()
+    if not old_text:
+        raise ValueError("params.oldText is required")
+    new_content = str(params.get("newContent") or "").strip()
+    if not new_content:
+        raise ValueError("params.newContent is required")
+    store = manager.curated_store()
+    res = store.replace(target, old_text, new_content)
+    if not res.get("success"):
+        raise ValueError(res.get("error") or "Failed to replace curated entry")
+    return {
+        "agentId": agent_id,
+        "target": target,
+        "entries": store.entries_for(target),
+        "usage": store.usage_for(target),
+        "message": res.get("message", "Entry replaced."),
+    }
+
+
+@_d.method("memory.curated.remove")
+async def _handle_memory_curated_remove(params: dict | None, ctx: RpcContext) -> dict[str, Any]:
+    if not isinstance(params, dict):
+        raise ValueError("params must be an object")
+    agent_id, manager = _require_memory_manager(ctx, params.get("agentId"))
+    target = str(params.get("target") or "memory").strip().lower()
+    if target not in ("memory", "user"):
+        raise ValueError("params.target must be 'memory' or 'user'")
+    old_text = str(params.get("oldText") or "").strip()
+    if not old_text:
+        raise ValueError("params.oldText is required")
+    store = manager.curated_store()
+    res = store.remove(target, old_text)
+    if not res.get("success"):
+        raise ValueError(res.get("error") or "Failed to remove curated entry")
+    return {
+        "agentId": agent_id,
+        "target": target,
+        "entries": store.entries_for(target),
+        "usage": store.usage_for(target),
+        "message": res.get("message", "Entry removed."),
+    }
+
+
+@_d.method("memory.curated.batch")
+async def _handle_memory_curated_batch(params: dict | None, ctx: RpcContext) -> dict[str, Any]:
+    if not isinstance(params, dict):
+        raise ValueError("params must be an object")
+    agent_id, manager = _require_memory_manager(ctx, params.get("agentId"))
+    target = str(params.get("target") or "memory").strip().lower()
+    if target not in ("memory", "user"):
+        raise ValueError("params.target must be 'memory' or 'user'")
+    operations = params.get("operations")
+    if not isinstance(operations, list):
+        raise ValueError("params.operations must be a list")
+    store = manager.curated_store()
+    res = store.apply_batch(target, operations)
+    if not res.get("success"):
+        raise ValueError(res.get("error") or "Batch operation failed")
+    return {
+        "agentId": agent_id,
+        "target": target,
+        "entries": store.entries_for(target),
+        "usage": store.usage_for(target),
+        "message": res.get("message", "Batch applied."),
+    }
+
+
+# ── Knowledge Base ingestion and management ───────────────────────────────────
+
+
+@_d.method("memory.knowledge_base.ingest")
+async def _handle_knowledge_base_ingest(params: dict | None, ctx: RpcContext) -> dict[str, Any]:
+    if not isinstance(params, dict):
+        raise ValueError("params must be an object")
+    agent_id, manager = _require_memory_manager(ctx, params.get("agentId"))
+    raw_path = str(params.get("path") or "").strip()
+    content = params.get("content")
+    filename = str(params.get("filename") or params.get("name") or "").strip()
+    recursive = _bool_param(params, "recursive", default=True) if "recursive" in params else True
+
+    from agentos.memory.ingest import ingest_directory, ingest_document
+
+    store = manager.store
+    workspace = _memory_root(manager).resolve()
+
+    if content is not None:
+        if not filename:
+            filename = "document.txt"
+        clean_name = Path(filename).name
+        if not clean_name or clean_name in (".", ".."):
+            clean_name = "document.txt"
+        rel_path = f"knowledge_base/{clean_name}"
+        doc_bytes: bytes
+        if isinstance(content, str):
+            doc_bytes = content.encode("utf-8")
+        elif isinstance(content, bytes):
+            doc_bytes = content
+        else:
+            raise ValueError("content must be string or bytes")
+        kb_dir = workspace / "knowledge_base"
+        kb_dir.mkdir(parents=True, exist_ok=True)
+        (kb_dir / clean_name).write_bytes(doc_bytes)
+        res = await ingest_document(store, doc_bytes, rel_path=rel_path, title=clean_name)
+        return {"agentId": agent_id, "results": [res.as_dict()]}
+
+    if not raw_path:
+        raise ValueError("params.path or params.content is required")
+
+    target_path = Path(raw_path)
+    if not target_path.is_absolute():
+        target_path = (workspace / target_path).resolve()
+    else:
+        target_path = target_path.resolve()
+
+    try:
+        rel_to_ws = target_path.relative_to(workspace)
+    except ValueError as exc:
+        raise ValueError("path traversal is not allowed") from exc
+
+    if not target_path.exists():
+        raise FileNotFoundError(f"Path does not exist: {raw_path}")
+
+    if target_path.is_dir():
+        rel_prefix = rel_to_ws.as_posix()
+        if not rel_prefix or rel_prefix == ".":
+            rel_prefix = "knowledge_base"
+        elif not rel_prefix.startswith("knowledge_base"):
+            rel_prefix = f"knowledge_base/{rel_prefix}"
+        results = await ingest_directory(
+            store, target_path, base_rel_prefix=rel_prefix, recursive=recursive
+        )
+        return {"agentId": agent_id, "results": [r.as_dict() for r in results]}
+    else:
+        rel_path = rel_to_ws.as_posix()
+        if not rel_path.startswith("knowledge_base/") and rel_path != "knowledge_base":
+            rel_path = f"knowledge_base/{rel_path}"
+        res = await ingest_document(store, target_path, rel_path=rel_path, title=target_path.name)
+        return {"agentId": agent_id, "results": [res.as_dict()]}
+
+
+@_d.method("memory.knowledge_base.list")
+async def _handle_knowledge_base_list(params: dict | None, ctx: RpcContext) -> dict[str, Any]:
+    if params is not None and not isinstance(params, dict):
+        raise ValueError("params must be an object")
+    agent_id, manager = _require_memory_manager(ctx, (params or {}).get("agentId"))
+    root = _memory_root(manager)
+    rows = _memory_source_rows(root, source_filter=MemorySource.knowledge_base)
+    return {"agentId": agent_id, "count": len(rows), "documents": rows}
+
+
+@_d.method("memory.knowledge_base.remove")
+async def _handle_knowledge_base_remove(params: dict | None, ctx: RpcContext) -> dict[str, Any]:
+    if not isinstance(params, dict):
+        raise ValueError("params must be an object")
+    raw_path = str(params.get("path") or "").strip()
+    if not raw_path:
+        raise ValueError("params.path is required")
+    agent_id, manager = _require_memory_manager(ctx, params.get("agentId"))
+    workspace = _memory_root(manager).resolve()
+    kb_root = (workspace / "knowledge_base").resolve()
+
+    rel = Path(raw_path)
+    if rel.is_absolute() or any(part in {"", ".", ".."} for part in rel.parts):
+        raise ValueError("path traversal is not allowed")
+    if len(rel.parts) < 2 or rel.parts[0] != "knowledge_base":
+        raise ValueError("params.path must be within knowledge_base/**")
+
+    target_file = (workspace / rel).resolve()
+    try:
+        target_file.relative_to(kb_root)
+    except ValueError as exc:
+        raise ValueError("path traversal is not allowed") from exc
+
+    await manager.store.remove_file(raw_path)
+    if target_file.is_file():
+        try:
+            target_file.unlink()
+        except OSError:
+            pass
+
+    return {"agentId": agent_id, "path": raw_path, "removed": True}

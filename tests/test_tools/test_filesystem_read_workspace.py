@@ -393,3 +393,20 @@ async def test_sensitive_path_priority_over_workspace_strict(
     assert dir_result["reason"] == "sensitive_path"
     assert "workspace_strict" not in file_result.get("message", "")
     assert "workspace_strict" not in dir_result.get("message", "")
+
+
+@pytest.mark.asyncio
+async def test_list_dir_broken_symlink_does_not_crash(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    (workspace / "valid.txt").write_text("hello", encoding="utf-8")
+    missing_target = workspace / "nonexistent.txt"
+    broken_link = workspace / "broken_link.txt"
+    _make_symlink(broken_link, missing_target)
+
+    with tool_context(workspace, strict=False):
+        output = await fs.list_dir(str(workspace))
+
+    assert "[file] valid.txt" in output
+    assert "broken_link.txt" in output
+

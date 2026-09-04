@@ -17,6 +17,8 @@ def _default_model_for_provider(provider: str) -> str:
         return "gpt-5.6-luna"
     if normalized == "opencap":
         return "gpt-5.6-luna"
+    if normalized == "surplus":
+        return "gpt-5.6-luna"
     if normalized == "openrouter":
         return "openai/gpt-5.6-luna"
     if normalized == "deepseek":
@@ -57,6 +59,7 @@ def run_init() -> None:
             "openrouter",
             "bankr",
             "opencap",
+            "surplus",
             "openai",
             "anthropic",
             "deepseek",

@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import hmac
 import json
+import time
 from typing import Any
 
 import httpx
@@ -333,11 +336,25 @@ async def test_slack_start_survives_manifest_sync_failure() -> None:
     await channel.stop()
 
 
-class _SlashRequest:
-    headers = {"content-type": "application/x-www-form-urlencoded"}
+_SLASH_SIGNING_SECRET = "s3cr3t"
 
-    def __init__(self, channel_id: str = "C1") -> None:
+
+class _SlashRequest:
+    def __init__(
+        self, channel_id: str = "C1", *, signing_secret: str = _SLASH_SIGNING_SECRET
+    ) -> None:
         self.channel_id = channel_id
+        timestamp = str(int(time.time()))
+        digest = hmac.HMAC(
+            signing_secret.encode(),
+            f"v0:{timestamp}:command=%2Fstatus".encode(),
+            hashlib.sha256,
+        ).hexdigest()
+        self.headers = {
+            "content-type": "application/x-www-form-urlencoded",
+            "X-Slack-Request-Timestamp": timestamp,
+            "X-Slack-Signature": f"v0={digest}",
+        }
 
     async def body(self) -> bytes:
         return b"command=%2Fstatus"
@@ -366,7 +383,9 @@ async def test_slack_slash_command_form_uses_channel_id_conversation_type(
     channel_type: str,
     is_group: bool,
 ) -> None:
-    channel = SlackChannel(token="token", slack_channel_id="C1")
+    channel = SlackChannel(
+        token="token", slack_channel_id="C1", signing_secret=_SLASH_SIGNING_SECRET
+    )
 
     response = await channel._handle_webhook(_SlashRequest(channel_id))  # noqa: SLF001
 

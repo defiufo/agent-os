@@ -34,6 +34,9 @@ class FallbackPolicy:
     """Policy for retrying failed provider calls and falling back to alternate models."""
 
     max_retries: int = 3
+    # Timeout-specific cap: each timeout retry burns the full read-timeout
+    # window (~120s), so 1 retry means at most ~4 min total (request + retry).
+    max_timeout_retries: int = 1
     fallback_models: list[str] = field(default_factory=list)
     base_backoff_ms: int = 1000
     max_backoff_ms: int = 30_000
@@ -70,6 +73,23 @@ class FallbackPolicy:
         if kind in retryable:
             return True
         return False  # Unknown errors: don't retry by default
+
+    def should_retry_timeout(
+        self,
+        kind: ProviderErrorKind,
+        attempt: int,
+        *,
+        is_timeout: bool = False,
+    ) -> bool:
+        """Timeout-aware retry decision.
+
+        When ``is_timeout`` is True the per-retry cost is the full read-timeout
+        window (typically 120 s), so we cap at ``max_timeout_retries`` instead
+        of the generic ``max_retries``.
+        """
+        if is_timeout and attempt >= self.max_timeout_retries:
+            return False
+        return self.should_retry(kind, attempt)
 
     def get_fallback_model(self, current_model: str) -> str | None:
         """Return the next fallback model after current_model, or None if exhausted."""

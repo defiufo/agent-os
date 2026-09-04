@@ -12,9 +12,21 @@ from agentos.mcp.client import MCPClient
 from agentos.mcp.types import MCPServerConfig, MCPToolDef
 from agentos.tools.registry import ToolRegistry
 from agentos.tools.schema_sanitize import sanitize_input_schema
-from agentos.tools.types import ToolSpec
+from agentos.tools.types import ToolHandler, ToolSpec
 
 log = structlog.get_logger(__name__)
+
+
+@dataclass(frozen=True)
+class MCPToolRegistration:
+    """One registry entry owned by an MCP client."""
+
+    spec: ToolSpec
+    handler: ToolHandler
+
+    @property
+    def name(self) -> str:
+        return self.spec.name
 
 
 @dataclass(frozen=True)
@@ -26,6 +38,7 @@ class ActiveMCPClient:
     transport: str
     client: MCPClient
     registered_tools: tuple[str, ...] = ()
+    tool_registrations: tuple[MCPToolRegistration, ...] = ()
 
     async def close(self) -> None:
         await self.client.close()
@@ -68,9 +81,34 @@ async def disconnect_and_unregister(owner: str, registry: ToolRegistry) -> int:
         for entry in active_clients_snapshot()
         if entry.owner == owner or entry.server_name == owner
     ]
-    for entry in entries:
-        for name in entry.registered_tools:
-            registry.unregister(name)
+    closing_ids = {id(entry) for entry in entries}
+    remaining = [entry for entry in _active_clients if id(entry) not in closing_ids]
+    affected_names = {
+        registration.name for entry in entries for registration in entry.tool_registrations
+    }
+    for name in affected_names:
+        current = registry.get(name)
+        if current is None:
+            continue
+        current_is_closing = any(
+            registration.name == name and registration.handler is current.handler
+            for entry in entries
+            for registration in entry.tool_registrations
+        )
+        if not current_is_closing:
+            continue
+        replacement = next(
+            (
+                registration
+                for entry in reversed(remaining)
+                for registration in reversed(entry.tool_registrations)
+                if registration.name == name
+            ),
+            None,
+        )
+        registry.unregister(name)
+        if replacement is not None:
+            registry.register(replacement.spec, replacement.handler)
     return await close_active_clients(owner)
 
 
@@ -98,7 +136,7 @@ def _make_tool_handler(
     tool_def: MCPToolDef,
     registry: ToolRegistry,
     timeout_seconds: float,
-) -> None:
+) -> MCPToolRegistration:
     """Register a single MCP tool into the registry with an mcp_ prefix."""
     # The server's schema goes out verbatim in every provider request, so it is
     # normalized once here rather than per turn. A shape one backend tolerates
@@ -127,6 +165,7 @@ def _make_tool_handler(
         return result.content
 
     registry.register(spec, handler)
+    return MCPToolRegistration(spec=spec, handler=handler)
 
 
 async def discover_and_register(
@@ -144,24 +183,27 @@ async def discover_and_register(
     entry: ActiveMCPClient | None = None
 
     registered: list[str] = []
+    registrations: list[MCPToolRegistration] = []
     try:
         await client.connect()
         tools = await client.list_tools()
         for t in tools:
-            _make_tool_handler(
+            registration = _make_tool_handler(
                 client,
                 t.name,
                 t,
                 registry,
                 timeout_seconds=config.tool_timeout_seconds,
             )
-            registered.append(f"mcp_{t.name}")
+            registered.append(registration.name)
+            registrations.append(registration)
         entry = ActiveMCPClient(
             owner=owner or config.name,
             server_name=config.name,
             transport=config.transport,
             client=client,
             registered_tools=tuple(registered),
+            tool_registrations=tuple(registrations),
         )
         _active_clients.append(entry)
     except BaseException:

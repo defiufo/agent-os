@@ -86,7 +86,11 @@ from agentos.provider import (
 from agentos.provider import (
     ToolUseStartEvent as ProviderToolUseStart,
 )
-from agentos.provider.failures import ProviderFailureKind, classify_provider_error
+from agentos.provider.failures import (
+    ProviderFailureKind,
+    classify_provider_error,
+    is_transport_timeout,
+)
 from agentos.provider.types import ContentBlockImage
 from agentos.result_budget import (
     ToolResultBudgetClass,
@@ -499,7 +503,15 @@ _MUTATING_TOOL_NAMES = frozenset({"write_file", "edit_file", "apply_patch"})
 _COMMAND_TOOL_NAMES = frozenset({"exec_command", "execute_code", "background_process"})
 # Sessions whose surface is a person in a chat rather than a checkout. There is
 # usually no test command to run there, so the verification nudge is withheld.
-_MESSAGING_SESSION_MARKERS = ("telegram", "slack", "discord", "msteams", "whatsapp", "signal")
+_MESSAGING_SESSION_MARKERS = (
+    "telegram",
+    "slack",
+    "discord",
+    "msteams",
+    "email",
+    "whatsapp",
+    "signal",
+)
 
 
 def _mutated_paths(arguments: dict[str, Any]) -> list[str]:
@@ -1367,6 +1379,7 @@ class Agent:
                             block.name,
                             block.input,
                         ),
+                        thought_signature=block.thought_signature,
                     )
                     continue
 
@@ -1391,6 +1404,7 @@ class Agent:
                         id=block.id,
                         name=block.name,
                         input=legacy_projected_input,
+                        thought_signature=block.thought_signature,
                     )
 
         if not replacements:
@@ -2342,6 +2356,7 @@ class Agent:
                                         tool_name=raw_ev.tool_name,
                                         arguments=arguments,
                                         synthetic_from_text=synthetic_from_text,
+                                        thought_signature=raw_ev.thought_signature,
                                     )
                                 )
 
@@ -2971,10 +2986,25 @@ class Agent:
                             )
                             _call_attempt += 1
                             continue
-                        if not _fallback.should_retry(kind, _retry_attempt):
+                        _is_timeout = is_transport_timeout(
+                            raw_code=provider_error.code,
+                            message=provider_error.message,
+                        )
+                        if not _fallback.should_retry_timeout(
+                            kind, _retry_attempt, is_timeout=_is_timeout
+                        ):
                             yield self._transition(AgentState.ERROR)
+                            _err_msg = provider_error.message
+                            if _is_timeout:
+                                _err_msg = (
+                                    f"{provider_error.message}. "
+                                    "The upstream model endpoint did not respond "
+                                    "within the timeout window. Try switching "
+                                    "to a different model tier with /c0, /c2, "
+                                    "or /auto to restore automatic routing."
+                                )
                             terminal_error = ErrorEvent(
-                                message=provider_error.message,
+                                message=_err_msg,
                                 code=provider_error.code,
                             )
                             yield terminal_error
@@ -2990,7 +3020,15 @@ class Agent:
                             attempt=_retry_attempt + 1,
                             kind=kind.value,
                             delay_s=round(delay, 2),
+                            is_timeout=_is_timeout,
                         )
+                        if _is_timeout:
+                            yield WarningEvent(
+                                code="provider_timeout_retry",
+                                message=(
+                                    "The upstream model timed out; retrying once before giving up."
+                                ),
+                            )
                         await asyncio.sleep(delay)
                         _retry_attempt += 1
                         _call_attempt += 1
@@ -3174,6 +3212,7 @@ class Agent:
                             id=tc.tool_use_id,
                             name=tc.tool_name,
                             input=tc.arguments,
+                            thought_signature=tc.thought_signature,
                         )
                     )
                 if assistant_content:
@@ -3495,6 +3534,7 @@ class Agent:
                         is_error=projected_result.is_error,
                         arguments=tc.arguments,
                         execution_status=projected_result.execution_status,
+                        thought_signature=tc.thought_signature,
                     )
                     replay_event = router_control_replay_event_from_payload(result.content)
                     if replay_event is not None:
@@ -3513,6 +3553,7 @@ class Agent:
                             arguments=retry_arguments,
                             synthetic_from_text=tc.synthetic_from_text,
                             origin_trace=tc.origin_trace,
+                            thought_signature=tc.thought_signature,
                         )
                         result = await _run_one(retry_call)
                         result_tool_call = retry_call
@@ -3529,6 +3570,7 @@ class Agent:
                             is_error=projected_result.is_error,
                             arguments=retry_arguments,
                             execution_status=projected_result.execution_status,
+                            thought_signature=retry_call.thought_signature,
                         )
                         replay_event = router_control_replay_event_from_payload(result.content)
                         if replay_event is not None:

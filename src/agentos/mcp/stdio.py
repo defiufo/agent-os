@@ -157,7 +157,17 @@ class MCPStdioClient(MCPClient):
         if content_length is None:
             raise ValueError("Missing Content-Length header in response")
 
-        body = await self._process.stdout.read(content_length)
+        # ``StreamReader.read(n)`` returns *up to* n bytes and yields as soon as
+        # any data is buffered, so a body split across pipe writes (large tool
+        # results, chunked flushes) would be truncated and fail ``json.loads``.
+        # ``readexactly`` enforces the Content-Length framing contract, matching
+        # the guard in the sibling ``_decode_response`` helper.
+        try:
+            body = await self._process.stdout.readexactly(content_length)
+        except asyncio.IncompleteReadError as exc:
+            raise ValueError(
+                f"Truncated body: expected {content_length} bytes, got {len(exc.partial)}"
+            ) from exc
         return cast(dict[str, Any], json.loads(body.decode()))
 
     async def list_tools(self) -> list[MCPToolDef]:
