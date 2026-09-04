@@ -10,6 +10,8 @@ See https://github.com/use-agent-os/agent-os/pull/546
 
 from __future__ import annotations
 
+import pytest
+
 from agentos.application.intent_cache import IntentApprovalCache
 
 
@@ -96,3 +98,21 @@ class TestRecordAndCheck:
         cache.clear()
         assert cache.check("rm /a") is False
         assert cache.check("rm /b") is False
+
+
+
+def test_cache_bounds_entries_and_evicts_oldest() -> None:
+    cache = IntentApprovalCache(max_entries=2)
+    cache.record("rm /a")
+    cache.record("rm /b")
+    cache.record("rm /c")
+
+    assert len(cache._entries) == 2  # noqa: SLF001
+    assert cache.check("rm /a") is False
+    assert cache.check("rm /b") is True
+    assert cache.check("rm /c") is True
+
+
+def test_cache_rejects_non_positive_capacity() -> None:
+    with pytest.raises(ValueError, match="max_entries must be positive"):
+        IntentApprovalCache(max_entries=0)
